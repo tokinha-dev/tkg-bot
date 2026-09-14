@@ -2,9 +2,14 @@ const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLat
 const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const pino = require('pino');
+const sharp = require('sharp');
 
 const CONFIG_PATH = './config.json';
 let config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+
+const NOME_BOT_FANCY = '𝐟𝐚𝐦𝐢𝐥𝐢𝐚-𝟏𝟓𝟕-𝐛𝐨𝐭';
+
+const mensagensBot = {};
 
 const WARNINGS_PATH = './warnings.json';
 const RANK_PATH = './rank.json';
@@ -114,11 +119,33 @@ async function iniciarBot() {
 
             for (const participant of participants) {
                 const nome = participant.split('@')[0];
-                const texto = `Seja bem vindo(a) a familia TKG-❤️\n\n@${nome} entrou em *${groupName}*`;
-                await sock.sendMessage(id, {
-                    text: texto,
-                    mentions: [participant]
-                });
+
+                let ppUrl;
+                try {
+                    ppUrl = await sock.profilePictureUrl(participant, 'image');
+                } catch { ppUrl = null; }
+
+                const texto =
+                    `*🎉 BEM-VINDO(A) À FAMÍLIA!* 🎉\n` +
+                    `\n` +
+                    `𝐅𝐀𝐌𝐈𝐋𝐈𝐀 𝟏𝟕𝟏🃏\n` +
+                    `\n` +
+                    `👋 @${nome} entrou no grupo *${groupName}*\n` +
+                    `\n` +
+                    `📖 Leia a descrição e se divirta! ❤️`;
+
+                if (ppUrl) {
+                    await sock.sendMessage(id, {
+                        image: { url: ppUrl },
+                        caption: texto,
+                        mentions: [participant]
+                    });
+                } else {
+                    await sock.sendMessage(id, {
+                        text: texto,
+                        mentions: [participant]
+                    });
+                }
                 console.log(` [BOAS-VINDAS] ${participant} em ${id}`);
             }
         } catch (e) {
@@ -129,7 +156,16 @@ async function iniciarBot() {
     sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
             try {
-                if (!msg.message || msg.key.fromMe) continue;
+                // Guarda as mensagens enviadas pelo bot pra poder limpar depois
+                if (msg.key.fromMe && msg.key.remoteJid) {
+                    const jidBot = msg.key.remoteJid;
+                    if (!mensagensBot[jidBot]) mensagensBot[jidBot] = [];
+                    mensagensBot[jidBot].push(msg.key);
+                    if (mensagensBot[jidBot].length > 60) mensagensBot[jidBot].shift();
+                    continue;
+                }
+
+                if (!msg.message) continue;
 
                 const jid = msg.key.remoteJid;
                 const isGroup = jid.endsWith('@g.us');
@@ -301,13 +337,57 @@ async function handleComandos(sock, msg, jid, texto, sender) {
         }
     }
 
+    if (comando === 'limpar') {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        const keys = mensagensBot[jid] || [];
+        if (keys.length === 0) return reply('🗑️ Nenhuma mensagem minha pra apagar aqui.');
+        let deletadas = 0;
+        for (const k of keys) {
+            try {
+                await sock.sendMessage(jid, { delete: k });
+                deletadas++;
+            } catch {}
+        }
+        mensagensBot[jid] = [];
+        return reply(`🗑️ ${deletadas} mensagens apagadas.`);
+    }
+
+    if (comando === 's' || comando === 'sticker' || comando === 'fig' || comando === 'figurinha') {
+        try {
+            const quoted = msg.message?.extendedTextMessage?.contextInfo?.quotedMessage;
+            let mediaMsg = null;
+
+            if (msg.message?.imageMessage) {
+                mediaMsg = msg;
+            } else if (quoted?.imageMessage) {
+                mediaMsg = { key: msg.key, message: quoted };
+            } else if (msg.message?.videoMessage || quoted?.videoMessage) {
+                return reply('❌ Figurinha de vídeo ainda não suportada. Manda uma imagem.');
+            } else if (quoted?.stickerMessage) {
+                return reply('❌ Não dá pra converter sticker em sticker.');
+            }
+
+            if (!mediaMsg) return reply(`Uso: envie uma imagem com legenda ${config.prefixo}s ou responda uma imagem com ${config.prefixo}s`);
+
+            const buffer = await downloadMediaMessage(mediaMsg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
+
+            const webp = await sharp(buffer).resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp().toBuffer();
+
+            await sock.sendMessage(jid, { sticker: webp }, { quoted: msg });
+            return;
+        } catch (e) {
+            console.log('Erro sticker:', e.message);
+            return reply('❌ Erro ao criar figurinha. Tente com uma imagem normal.');
+        }
+    }
+
     if (comando === 'ping') {
         return reply('🏓 Pong! Bot online.');
     }
 
     if (comando === 'ajuda' || comando === 'help' || comando === 'menu') {
         const menu =
-            `*🤖 ${config.nomeBot} - Menu de Comandos* 🤖\n` +
+            `*🤖 ${NOME_BOT_FANCY} - Menu de Comandos* 🤖\n` +
             `\n` +
             `🛡️ *MODERAÇÃO (só ADMs)* 🛡️\n` +
             `➕ \`${config.prefixo}addpalavra <palavra>\` - Adiciona palavra proibida\n` +
@@ -316,9 +396,11 @@ async function handleComandos(sock, msg, jid, texto, sender) {
             `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +
             `♻️ \`${config.prefixo}zerar @usuario\` - Zera advertências\n` +
             `🚫 \`${config.prefixo}ban @usuario\` - Bane do grupo\n` +
+            `🗑️ \`${config.prefixo}limpar\` - Apaga mensagens do bot\n` +
             `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
             `\n` +
             `📡 *GERAL* 📡\n` +
+            `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
             `🏓 \`${config.prefixo}ping\` - Testa se o bot está online\n` +
             `❓ \`${config.prefixo}ajuda\` - Mostra este menu`;
 
@@ -326,13 +408,14 @@ async function handleComandos(sock, msg, jid, texto, sender) {
             return reply(menu);
         } else {
             return reply(
-                `*🤖 ${config.nomeBot} - Menu de Comandos* 🤖\n` +
+                `*🤖 ${NOME_BOT_FANCY} - Menu de Comandos* 🤖\n` +
                 `\n` +
                 `👥 *MEMBROS* 👥\n` +
                 `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
                 `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
                 `\n` +
                 `📡 *GERAL* 📡\n` +
+                `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
                 `🏓 \`${config.prefixo}ping\` - Testa se o bot está online\n` +
                 `❓ \`${config.prefixo}ajuda\` - Mostra este menu`
             );
