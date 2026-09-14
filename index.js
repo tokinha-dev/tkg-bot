@@ -88,6 +88,18 @@ async function iniciarBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
+    // --- Pareamento por código (pra hospedagem, sem QR) ---
+    const numeroPareamento = String(process.env.NUMERO_BOT || config.numeroBot || '').replace(/\D/g, '');
+    if (numeroPareamento && !sock.authState.creds.registered) {
+        try {
+            const code = await sock.requestPairingCode(numeroPareamento);
+            console.log(`\n CÓDIGO DE PAREAMENTO: ${code}`);
+            console.log(' No WhatsApp do bot: Aparelhos conectados > Conectar um aparelho > Conectar com número de telefone');
+        } catch (e) {
+            console.log(' Erro ao gerar código de pareamento:', e.message);
+        }
+    }
+
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
 

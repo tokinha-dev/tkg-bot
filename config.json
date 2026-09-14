@@ -1,6 +1,7 @@
 {
   "nomeBot": "familia-157-bot",
   "prefixo": "!",
+  "numeroBot": "",
   "maxAdvertencias": 3,
   "acaoAposMax": "remover",
   "mensagemAdvertencia": "links e mensagens da descrição não são permitidos! ⚠️ Advertência {atual}/{max}",
