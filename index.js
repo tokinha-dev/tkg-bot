@@ -1,8 +1,7 @@
-const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } = require('@whiskeysockets/baileys');
-const qrcode = require('qrcode-terminal');
-const fs = require('fs');
-const pino = require('pino');
-const sharp = require('sharp');
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
+import qrcode from 'qrcode-terminal';
+import fs from 'node:fs';
+import pino from 'pino';
 
 const CONFIG_PATH = './config.json';
 let config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
@@ -50,6 +49,16 @@ function getTextoMensagem(msg) {
     );
 }
 
+// --- Identidade anti-LID: prefere o número de telefone (PN) ---
+function getSender(msg, jid) {
+    return msg.key.senderPn || msg.key.participant || msg.participant || jid;
+}
+
+function ehAdmin(participants, jid) {
+    const p = participants.find(x => x.id === jid || x.phoneNumber === jid || x.lid === jid);
+    return p?.admin === 'admin' || p?.admin === 'superadmin';
+}
+
 function contemConteudoProibido(texto) {
     if (!texto) return { proibido: false };
 
@@ -76,8 +85,22 @@ function contemConteudoProibido(texto) {
 }
 
 async function iniciarBot() {
+    // --- Restaura sessão via variável de ambiente (hospedagem) ---
+    if (process.env.AUTH_B64) {
+        try {
+            if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
+            const credsJson = Buffer.from(process.env.AUTH_B64, 'base64').toString('utf-8');
+            JSON.parse(credsJson); // valida
+            fs.writeFileSync(`${AUTH_FOLDER}/creds.json`, credsJson);
+            console.log(' Sessão restaurada via AUTH_B64');
+        } catch (e) {
+            console.log(' Erro ao restaurar sessão AUTH_B64:', e.message);
+        }
+    }
+
     const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
     const { version } = await fetchLatestBaileysVersion();
+    console.log(' Versão WA usada:', version.join('.'));
 
     const sock = makeWASocket({
         version,
@@ -88,24 +111,30 @@ async function iniciarBot() {
 
     sock.ev.on('creds.update', saveCreds);
 
-    // --- Pareamento por código (pra hospedagem, sem QR) ---
+    // --- Pareamento por código: pede quando a conexão já está aberta (evento qr) ---
     const numeroPareamento = String(process.env.NUMERO_BOT || config.numeroBot || '').replace(/\D/g, '');
-    if (numeroPareamento && !sock.authState.creds.registered) {
-        try {
-            const code = await sock.requestPairingCode(numeroPareamento);
-            console.log(`\n CÓDIGO DE PAREAMENTO: ${code}`);
-            console.log(' No WhatsApp do bot: Aparelhos conectados > Conectar um aparelho > Conectar com número de telefone');
-        } catch (e) {
-            console.log(' Erro ao gerar código de pareamento:', e.message);
-        }
-    }
+    let pareamentoSolicitado = false;
 
-    sock.ev.on('connection.update', (update) => {
+    sock.ev.on('connection.update', async (update) => {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log('\n Escaneie o QR Code abaixo com o WhatsApp:');
-            qrcode.generate(qr, { small: true });
+            // Se tem número configurado e NENHUMA identidade ainda, usa código de pareamento (conexão já aberta aqui)
+            const semIdentidade = !sock.authState.creds.me;
+            if (numeroPareamento && semIdentidade && !sock.authState.creds.registered && !pareamentoSolicitado) {
+                pareamentoSolicitado = true;
+                try {
+                    const code = await sock.requestPairingCode(numeroPareamento);
+                    console.log(`\n CÓDIGO DE PAREAMENTO: ${code}`);
+                    console.log(' No WhatsApp do bot: Aparelhos conectados > Conectar um aparelho > Conectar com número de telefone');
+                } catch (e) {
+                    console.log(' Erro ao gerar código de pareamento:', e.message);
+                    pareamentoSolicitado = false;
+                }
+            } else if (!numeroPareamento) {
+                console.log('\n Escaneie o QR Code abaixo com o WhatsApp:');
+                qrcode.generate(qr, { small: true });
+            }
         }
 
         if (connection === 'open') {
@@ -114,8 +143,11 @@ async function iniciarBot() {
         }
 
         if (connection === 'close') {
-            const shouldReconnect = lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-            console.log(' Conexão fechada. Reconectando:', shouldReconnect);
+            const statusCode = lastDisconnect?.error?.output?.statusCode;
+            const errMsg = lastDisconnect?.error?.message;
+            console.log(` Conexão fechada. status=${statusCode} erro=${errMsg}`);
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+            console.log(' Reconectando:', shouldReconnect);
             if (shouldReconnect) iniciarBot();
         }
     });
@@ -189,7 +221,7 @@ async function iniciarBot() {
                 const texto = getTextoMensagem(msg);
                 if (!texto) continue;
 
-                const sender = msg.key.participant || msg.participant || jid;
+                const sender = getSender(msg, jid);
 
                 // --- Comandos ---
                 if (texto.startsWith(config.prefixo)) {
@@ -200,8 +232,7 @@ async function iniciarBot() {
                 // Ignora admins se configurado
                 if (config.ignorarAdmins) {
                     const metadata = await sock.groupMetadata(jid);
-                    const senderAdmin = metadata.participants.find(p => p.id === sender);
-                    const isAdmin = senderAdmin?.admin === 'admin' || senderAdmin?.admin === 'superadmin';
+                    const isAdmin = ehAdmin(metadata.participants, sender);
                     if (isAdmin) continue;
                 }
 
@@ -275,9 +306,10 @@ async function handleComandos(sock, msg, jid, texto, sender) {
     const args = texto.slice(config.prefixo.length).trim().split(/ +/);
     const comando = args.shift().toLowerCase();
     const metadata = await sock.groupMetadata(jid);
-    const senderData = metadata.participants.find(p => p.id === sender);
-    const isAdmin = senderData?.admin === 'admin' || senderData?.admin === 'superadmin';
-    const isBotAdmin = metadata.participants.find(p => p.id === sock.user.id)?.admin;
+    const isAdmin = ehAdmin(metadata.participants, sender);
+    const botId = sock.user.id;
+    const botP = metadata.participants.find(p => p.id === botId || p.phoneNumber === botId || p.lid === botId);
+    const isBotAdmin = botP?.admin;
 
     // helper pra responder
     const reply = (t) => sock.sendMessage(jid, { text: t }, { quoted: msg });
@@ -383,7 +415,13 @@ async function handleComandos(sock, msg, jid, texto, sender) {
 
             const buffer = await downloadMediaMessage(mediaMsg, 'buffer', {}, { logger: pino({ level: 'silent' }), reuploadRequest: sock.updateMediaMessage });
 
-            const webp = await sharp(buffer).resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp().toBuffer();
+            let sharpLib;
+            try {
+                sharpLib = (await import('sharp')).default;
+            } catch {
+                return reply('❌ Figurinha indisponível no momento.');
+            }
+            const webp = await sharpLib(buffer).resize(512, 512, { fit: 'contain', background: { r: 0, g: 0, b: 0, alpha: 0 } }).webp().toBuffer();
 
             await sock.sendMessage(jid, { sticker: webp }, { quoted: msg });
             return;

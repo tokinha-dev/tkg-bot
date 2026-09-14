@@ -1,5 +1,8 @@
 node_modules/
 auth_info/
+auth_info_backup/
+auth_b64.txt
 warnings.json
+rank.json
 *.log
 .env
