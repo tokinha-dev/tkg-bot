@@ -1,0 +1,24 @@
+{
+  "nomeBot": "tkg-bot",
+  "prefixo": "!",
+  "maxAdvertencias": 3,
+  "acaoAposMax": "remover",
+  "mensagemAdvertencia": "links e mensagens da descrição não são permitidos! ⚠️ Advertência {atual}/{max}",
+  "antilink": true,
+  "palavrasProibidas": [
+    "palavra1",
+    "palavra2",
+    "exemplo",
+    "pix"
+  ],
+  "linkRegex": [
+    "https?://",
+    "www\\.",
+    "wa\\.me",
+    "t\\.me",
+    "bit\\.ly",
+    "chat\\.whatsapp\\.com"
+  ],
+  "gruposPermitidos": [],
+  "ignorarAdmins": true
+}
