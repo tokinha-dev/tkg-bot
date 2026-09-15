@@ -357,8 +357,9 @@ async function handleComandos(sock, msg, jid, texto, sender) {
 
     if (comando === 'zerar' || comando === 'resetwarn') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const alvo = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-        if (!alvo) return reply(`Uso: ${config.prefixo}zerar @usuario`);
+        const ctxZerar = msg.message?.extendedTextMessage?.contextInfo;
+        const alvo = ctxZerar?.mentionedJid?.[0] || ctxZerar?.participant;
+        if (!alvo) return reply(`Uso: ${config.prefixo}zerar @usuario ou responda a mensagem dele com ${config.prefixo}zerar`);
         const warnings = carregarWarnings();
         if (warnings[jid]) warnings[jid][alvo] = 0;
         salvarWarnings(warnings);
@@ -367,9 +368,11 @@ async function handleComandos(sock, msg, jid, texto, sender) {
 
     if (comando === 'ban') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const alvo = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0];
-        if (!alvo) return reply(`Uso: ${config.prefixo}ban @usuario`);
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const alvo = ctx?.mentionedJid?.[0] || ctx?.participant;
+        if (!alvo) return reply(`Uso: ${config.prefixo}ban @usuario ou responda a mensagem dele com ${config.prefixo}ban`);
         if (alvo === sender) return reply('❌ Você não pode se banir kkk');
+        if (alvo === sock.user.id) return reply('❌ Não vou me banir kkk');
         try {
             await sock.groupParticipantsUpdate(jid, [alvo], 'remove');
             return sock.sendMessage(jid, {
@@ -445,7 +448,7 @@ async function handleComandos(sock, msg, jid, texto, sender) {
             `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
             `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +
             `♻️ \`${config.prefixo}zerar @usuario\` - Zera advertências\n` +
-            `🚫 \`${config.prefixo}ban @usuario\` - Bane do grupo\n` +
+            `🚫 \`${config.prefixo}ban\` - Bane (marca ou responde a msg)\n` +
             `🗑️ \`${config.prefixo}limpar\` - Apaga mensagens do bot\n` +
             `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
             `\n` +
