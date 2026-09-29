@@ -19,6 +19,12 @@ function aplicarPadroes(c) {
     c.maxAdvertencias ??= 3;
     c.acaoAposMax ??= 'remover';
     c.mensagemAdvertencia ??= 'mensagem não permitida! ⚠️ Advertência {atual}/{max}';
+    c.mensagemBoasVindas ??=
+        `🎉 *BEM-VINDO(A) À FAMÍLIA 157* 🎉\n` +
+        `👋 @{nome} acabou de entrar no grupo *{grupo}*\n` +
+        `\n` +
+        `📖 Leia a descrição e se divirta!`;
+    c.mensagemBanAdmin ??= 'kkkkkk você não pode banir esse tchola🤷‍♂️🤣';
     c.antilink ??= true;
     c.palavrasProibidas ??= [];
     c.linkRegex ??= [];
@@ -273,6 +279,19 @@ function chaveCanonica(jid, sender, participants) {
     return p?.id || sender;
 }
 
+/**
+ * O WhatsApp entrega o LID (identificador interno), não o telefone. Comparar o
+ * `digitos()` do LID com o número do config nunca bateria, então resolvemos o
+ * participante e comparamos telefone E LID.
+ */
+function ehDono(ref, participants) {
+    if (!config.ignorarDono || !config.donos?.length) return false;
+    const p = acharParticipante(participants, ref);
+    const cands = [ref, p?.id, p?.lid, p?.phoneNumber].filter(Boolean).map(digitos).filter(Boolean);
+    const lista = config.donos.map(digitos).filter(Boolean);
+    return cands.some(c => lista.includes(c));
+}
+
 function ehProtegido(sock, sender, participants) {
     if (!sender) return true;
     const botId = sock.user?.id;
@@ -280,12 +299,7 @@ function ehProtegido(sock, sender, participants) {
     if (sender === botId || sender === botLid) return true;
     if (botId && semSufixo(sender) === semSufixo(botId)) return true;
 
-    if (config.ignorarDono && config.donos?.length) {
-        const num = digitos(sender);
-        if (!num) return true;
-        const meu = digitos(botId || botLid);
-        if (config.donos.some(d => digitos(d) === num) || (meu && num === meu)) return true;
-    }
+    if (ehDono(sender, participants)) return true;
 
     if (config.ignorarAdmins && ehAdmin(participants, sender)) return true;
 
@@ -327,9 +341,21 @@ function tipoDaMidia(m) {
 
 const TIPOS_MIDIA = ['imagem', 'imagem-efemera', 'video', 'video-efemero', 'figurinha', 'documento'];
 
-/** Monta a key da mensagem citada, com o participant (sem isso o WhatsApp recusa). */
+/**
+ * Key da mensagem citada. Usa a key original guardada no cache (tem o participant
+ * correto, o WhatsApp exige) e só remonta como último recurso.
+ */
 function chaveCitada(ctx, jid) {
     if (!ctx?.stanzaId) return null;
+    const guardada = cacheKeys.get(`${jid}|${ctx.stanzaId}`);
+    if (guardada) {
+        return {
+            remoteJid: guardada.remoteJid || jid,
+            id: guardada.id,
+            fromMe: guardada.fromMe,
+            participant: guardada.participant
+        };
+    }
     return { remoteJid: jid, id: ctx.stanzaId, fromMe: false, participant: ctx.participant || undefined };
 }
 
@@ -399,6 +425,16 @@ async function aplicarAdvertencia(sock, jid, alvo, motivo, key) {
 // ====================== ANTI-DUPLICIDADE ======================
 const processados = new Set();
 const filaProcessados = [];
+// Guarda a key EXATA de cada mensagem recebida. Sem isso, o !apagar precisa
+// remontar a key pelo contextInfo e perde o participant -> WhatsApp ignora o delete.
+const cacheKeys = new Map();
+
+function guardarKey(jid, key) {
+    const id = `${jid}|${key.id}`;
+    cacheKeys.set(id, key);
+    if (cacheKeys.size > 2000) cacheKeys.delete(cacheKeys.keys().next().value);
+    return id;
+}
 
 function jaProcessou(key) {
     const id = `${key.remoteJid}|${key.id}|${key.participant || ''}`;
@@ -510,35 +546,57 @@ async function iniciarBot() {
             if (action !== 'add') return;
 
             const metadata = await sock.groupMetadata(id);
+            registrarAliases(id, metadata.participants);
             const groupName = metadata.subject;
 
-            for (const participant of participants) {
-                const nome = participant.split('@')[0];
+            for (const ref of participants) {
+                const p = acharParticipante(metadata.participants, ref);
+                const lid = p?.id || ref;
+                const pn = p?.phoneNumber || (String(ref).includes('@s.whatsapp.net') ? ref : null);
+                const nome = semSufixo(lid);
+                const numero = digitos(pn);
+                const link = numero ? `https://wa.me/${numero}` : null;
 
-                let ppUrl;
-                try {
-                    ppUrl = await sock.profilePictureUrl(participant, 'image');
-                } catch { ppUrl = null; }
-
-                const texto =
-                    `*🎉 BEM-VINDO(A) À FAMÍLIA!* 🎉\n` +
-                    `\n` +
-                    `𝐅𝐀𝐌𝐈𝐋𝐈𝐀 𝟏𝟓𝟕🃏\n` +
-                    `\n` +
-                    `👋 @${nome} entrou no grupo *${groupName}*\n` +
-                    `\n` +
-                    `📖 Leia a descrição e se divirta! ❤️`;
-
-                if (ppUrl) {
-                    await sock.sendMessage(id, {
-                        image: { url: ppUrl },
-                        caption: texto,
-                        mentions: [participant]
-                    });
-                } else {
-                    await sock.sendMessage(id, { text: texto, mentions: [participant] });
+                // Foto de perfil: tenta o telefone primeiro, o LID costuma falhar
+                let ppUrl = null;
+                for (const alvo of [pn, lid].filter(Boolean)) {
+                    try {
+                        ppUrl = await sock.profilePictureUrl(alvo, 'image');
+                        if (ppUrl) break;
+                    } catch { /* sem foto */ }
                 }
-                console.log(` [BOAS-VINDAS] ${participant} em ${id}`);
+
+                const texto = config.mensagemBoasVindas
+                    .replace(/{nome}/g, nome)
+                    .replace(/{grupo}/g, groupName)
+                    .replace(/{link}/g, link || '(sem número pra link)');
+
+                const botoes = link
+                    ? [{
+                        buttonText: `💬 Chamar o ${nome}`,
+                        nativeFlowInfo: {
+                            name: 'cta_url',
+                            buttonParamsJson: JSON.stringify({ display_text: 'Abrir conversa', url: link })
+                        }
+                    }]
+                    : null;
+
+                let enviou = false;
+                const corpo = ppUrl ? { image: { url: ppUrl }, caption: texto, mentions: [lid] } : { text: texto, mentions: [lid] };
+
+                if (botoes) {
+                    try {
+                        await sock.sendMessage(id, corpo, { buttons: botoes });
+                        enviou = true;
+                    } catch {
+                        console.log(' [BOAS-VINDAS] botão falhou, mandando sem botão');
+                    }
+                }
+                if (!enviou) {
+                    await sock.sendMessage(id, corpo);
+                }
+
+                console.log(` [BOAS-VINDAS] ${lid} em ${id} | foto=${ppUrl ? 'sim' : 'não'} | link=${link || 'não'}`);
             }
         } catch (e) {
             console.log('Erro no boas-vindas:', e.message);
@@ -564,6 +622,8 @@ async function iniciarBot() {
                 const jid = msg.key.remoteJid;
                 if (!jid || !jid.endsWith('@g.us')) continue;
 
+                guardarKey(jid, msg.key);
+
                 if (config.gruposPermitidos.length > 0 && !config.gruposPermitidos.includes(jid)) continue;
 
                 const texto = getTextoMensagem(msg);
@@ -575,11 +635,13 @@ async function iniciarBot() {
 
                 const sender = chaveCanonica(jid, senderBruto, metadata.participants);
 
-                // Mídia "ver uma vez" é o esconderijo clássico de conteúdo adulto
-                if (!texto && config.bloquearViewOnce) {
+                // Mídia "ver uma vez" é o esconderijo clássico de conteúdo adulto.
+                // Checagem independente de texto: foto view-once COM legenda também cai aqui.
+                if (config.bloquearViewOnce) {
                     const tipo = tipoDaMidia(msg.message);
-                    if ((tipo === 'imagem-efemera' || tipo === 'video-efemero') && !ehProtegido(sock, sender, metadata.participants)) {
-                        await aplicarAdvertencia(sock, jid, sender, `${tipo} (view once)`, msg.key);
+                    if (tipo === 'imagem-efemera' || tipo === 'video-efemero') {
+                        if (ehProtegido(sock, sender, metadata.participants)) continue;
+                        await aplicarAdvertencia(sock, jid, sender, `${tipo} (ver uma vez)`, msg.key);
                         continue;
                     }
                 }
@@ -702,12 +764,16 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const ctx = msg.message?.extendedTextMessage?.contextInfo;
         if (!ctx?.stanzaId) return reply(`↩️ Responda a mensagem que quer apagar com ${config.prefixo}apagar`);
         const tipo = tipoDaMidia(ctx.quotedMessage) || 'mensagem';
-        const r = await apagarMensagem(sock, jid, chaveCitada(ctx, jid));
+        const key = chaveCitada(ctx, jid);
+        const doCache = cacheKeys.has(`${jid}|${ctx.stanzaId}`);
+        console.log(` [APAGAR] tipo=${tipo} key=${JSON.stringify(key)} doCache=${doCache}`);
+
+        const r = await apagarMensagem(sock, jid, key);
         if (!r.ok) {
             console.log(` [APAGAR] falhou: ${r.erro}`);
             return reply('❌ Não consegui apagar. O bot precisa ser admin do grupo.');
         }
-        return reply(`🗑️ Apagada (${tipo}).`);
+        return reply(`🗑️ Apagada (${tipo}).${doCache ? '' : '\n⚠️ Key veio do cache? Não — pode ser msg antiga.'}`);
     }
 
     if (comando === '+18' || comando === 'adulto' || comando === 'nsfw' || comando === 'porn') {
@@ -753,6 +819,12 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const alvo = chaveCanonica(jid, alvoBruto, metadata.participants);
         if (alvo === sender) return reply('❌ Você não pode se banir kkk');
         if (alvo === sock.user.id || alvo === sock.user.lid) return reply('❌ Não vou me banir kkk');
+
+        // Admin não cai: só o dono do bot consegue remover outro admin
+        if (ehAdmin(metadata.participants, alvo) && !ehDono(sender, metadata.participants)) {
+            return reply(config.mensagemBanAdmin);
+        }
+
         try {
             await sock.groupParticipantsUpdate(jid, [alvo], 'remove');
             return reply(`🚫 @${semSufixo(alvo)} foi banido do grupo.`, [alvo]);

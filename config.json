@@ -5,6 +5,8 @@
   "maxAdvertencias": 3,
   "acaoAposMax": "remover",
   "mensagemAdvertencia": "links e mensagens da descrição não são permitidos! ⚠️ Advertência {atual}/{max}",
+  "mensagemBoasVindas": "🎉 *BEM-VINDO(A) À FAMÍLIA 157* 🎉\n👋 @{nome} acabou de entrar no grupo *{grupo}*\n\n📖 Leia a descrição e se divirta!",
+  "mensagemBanAdmin": "kkkkkk você não pode banir esse tchola🤷‍♂️🤣",
   "antilink": true,
   "palavrasProibidas": [
     "pix"
@@ -20,8 +22,11 @@
   "gruposPermitidos": [],
   "ignorarAdmins": true,
   "ignorarDono": true,
-  "donos": [],
+  "donos": [
+    "554898195564",
+    "5511995485573"
+  ],
   "dryRun": true,
-  "bloquearViewOnce": false,
+  "bloquearViewOnce": true,
   "cacheMetadataMs": 30000
 }
