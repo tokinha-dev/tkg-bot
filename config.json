@@ -28,5 +28,11 @@
   ],
   "dryRun": true,
   "bloquearViewOnce": true,
-  "cacheMetadataMs": 30000
+  "cacheMetadataMs": 30000,
+  "cassinoAtivo": true,
+  "apostaMinima": 1,
+  "saldoInicial": 10,
+  "bonusDiario": 0,
+  "convidadosNecessarios": 2,
+  "fichasPorConvidado": 10
 }

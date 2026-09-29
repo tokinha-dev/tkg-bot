@@ -6,6 +6,8 @@ import pino from 'pino';
 const CONFIG_PATH = './config.json';
 const WARNINGS_PATH = './warnings.json';
 const RANK_PATH = './rank.json';
+const CASSINO_PATH = './cassino.json';
+const CONVITES_PATH = './convites.json';
 const AUTH_FOLDER = './auth_info';
 
 const NOME_BOT_FANCY = '𝐟𝐚𝐦𝐢𝐥𝐢𝐚-𝟏𝟓𝟕-𝐛𝐨𝐭';
@@ -34,6 +36,11 @@ function aplicarPadroes(c) {
     c.donos ??= [];
     c.dryRun ??= false;
     c.bloquearViewOnce ??= false;
+    c.cassinoAtivo ??= true;
+    c.apostaMinima ??= 1;
+    c.saldoInicial ??= 10;
+    c.convidadosNecessarios ??= 2;
+    c.fichasPorConvidado ??= 10;
     c.cacheMetadataMs ??= 30000;
     return c;
 }
@@ -194,6 +201,18 @@ function carregarRank() {
 
 function salvarRank(data) {
     fs.writeFileSync(RANK_PATH, JSON.stringify(data, null, 2));
+}
+
+function carregarJson(caminho, padrao = {}) {
+    if (!fs.existsSync(caminho)) {
+        fs.writeFileSync(caminho, JSON.stringify(padrao, null, 2));
+        return padrao;
+    }
+    try {
+        return JSON.parse(fs.readFileSync(caminho, 'utf-8'));
+    } catch {
+        return padrao;
+    }
 }
 
 function getTextoMensagem(msg) {
@@ -420,6 +439,66 @@ async function aplicarAdvertencia(sock, jid, alvo, motivo, key) {
     }
 
     return { apagada: true, atual };
+}
+
+// ====================== CASSINO ======================
+const VERMELHOS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
+
+// Símbolos do tigrinho: [emoji, peso, premio triplo, premio par]
+const SIMBOLOS = [
+    { e: '🍒', peso: 30, trio: 5, par: 2 },
+    { e: '🍋', peso: 24, trio: 8, par: 2 },
+    { e: '🍉', peso: 18, trio: 12, par: 2 },
+    { e: '🔔', peso: 14, trio: 20, par: 3 },
+    { e: '⭐', peso: 9, trio: 35, par: 3 },
+    { e: '💎', peso: 5, trio: 80, par: 4 }
+];
+
+function saldoDe(dados, jid, user) {
+    if (!dados[jid]) dados[jid] = {};
+    if (dados[jid][user] === undefined) dados[jid][user] = config.saldoInicial ?? 100;
+    return dados[jid][user];
+}
+
+function definirSaldo(dados, jid, user, valor) {
+    if (!dados[jid]) dados[jid] = {};
+    dados[jid][user] = Math.max(0, Math.floor(valor));
+    return dados[jid][user];
+}
+
+// Zera a carteira -> precisa recrutar. Usado como resposta de "saldo insuficiente".
+function avisoSemSaldo(saldo) {
+    const precisa = config.convidadosNecessarios ?? 2;
+    return `💸 *Você ficou sem fichas!*\n\n` +
+        `Saldo atual: *${(saldo || 0).toLocaleString('pt-BR')}*\n` +
+        `🎁 Chame *${precisa} pessoas novas* pro grupo e ganhe *${(config.fichasPorConvidado ?? 10) * precisa} fichas*!\n\n` +
+        `Como chamar: marque as ${precisa} pessoas numa mensagem e envie\n` +
+        `\`${config.prefixo}convidar @pessoa1 @pessoa2\``;
+}
+
+// Quem já foi "convidado" por alguém. Chave global (jid + pessoa) pra mesma
+// pessoa nunca valer como novata duas vezes, nem em grupos diferentes.
+function foiConvidado(reg, jid, user) {
+    return !!reg[jid + '|' + user];
+}
+
+function marcarConvidado(reg, jid, user, porQuem) {
+    reg[jid + '|' + user] = { por: porQuem, em: Date.now() };
+}
+
+function girarTigrinho() {
+    const total = SIMBOLOS.reduce((s, x) => s + x.peso, 0);
+    const rolo = [];
+    for (let i = 0; i < 3; i++) {
+        let n = Math.random() * total;
+        let escolhido = SIMBOLOS[0];
+        for (const s of SIMBOLOS) {
+            n -= s.peso;
+            if (n <= 0) { escolhido = s; break; }
+        }
+        rolo.push(escolhido);
+    }
+    return rolo;
 }
 
 // ====================== ANTI-DUPLICIDADE ======================
@@ -704,7 +783,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
 
     if (comando === 'listapalavras' || comando === 'listwords') {
         const lista = config.palavrasProibidas.join(', ') || '(nenhuma)';
-        return reply(`📋 Palavras proibidas:\n${lista}\n\nAntilink: ${config.antilink ? 'ON' : 'OFF'}\nDry-run: ${config.dryRun ? 'ON' : 'OFF'}`);
+        return reply(`📋 Palavras proibidas:\n${lista}\n\nAntilink: ${config.antilink ? 'ON' : 'OFF'}`);
     }
 
     if (comando === 'teste' || comando === 'test') {
@@ -724,16 +803,6 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         else return reply(`Uso: ${config.prefixo}antilink on/off (atual: ${config.antilink ? 'ON' : 'OFF'})`);
         salvarConfig();
         return reply(`✅ Antilink: ${config.antilink ? 'ATIVADO' : 'DESATIVADO'}`);
-    }
-
-    if (comando === 'dryrun') {
-        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const opt = args[0]?.toLowerCase();
-        if (opt === 'on') config.dryRun = true;
-        else if (opt === 'off') config.dryRun = false;
-        else return reply(`Uso: ${config.prefixo}dryrun on/off (atual: ${config.dryRun ? 'ON' : 'OFF'})`);
-        salvarConfig();
-        return reply(`🧪 Dry-run: ${config.dryRun ? 'ON (só loga, não apaga)' : 'OFF (apagando normal)'}`);
     }
 
     if (comando === 'advertencias' || comando === 'warns') {
@@ -799,16 +868,6 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         if (res.dryRun) return reply(`🧪 DRY-RUN: teria apagado a ${tipo} e dado advertência para @${semSufixo(alvo)}.`);
         if (res.erro) return reply(`❌ Mídia NÃO apagada (${res.erro}) e advertência não contada.`);
         return;
-    }
-
-    if (comando === 'viewonce') {
-        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const opt = args[0]?.toLowerCase();
-        if (opt === 'on') config.bloquearViewOnce = true;
-        else if (opt === 'off') config.bloquearViewOnce = false;
-        else return reply(`Uso: ${config.prefixo}viewonce on/off (atual: ${config.bloquearViewOnce ? 'ON' : 'OFF'})`);
-        salvarConfig();
-        return reply(`🕵️ Mídia "ver uma vez": ${config.bloquearViewOnce ? 'BLOQUEADA (apaga + advertência)' : 'liberada'}`);
     }
 
     if (comando === 'ban') {
@@ -883,6 +942,254 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         }
     }
 
+    // ================= CASSINO =================
+    if (['saldo', 'saldo', 'banca', 'coins', 'moeda'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const dados = carregarJson(CASSINO_PATH);
+        const s = saldoDe(dados, jid, sender);
+        if (s <= 0) return reply(avisoSemSaldo(s), [sender]);
+        return reply(
+            `💰 @${semSufixo(sender)} você tem *${s.toLocaleString('pt-BR')}* fichas.\n\n` +
+            `🎰 Roleta: \`${config.prefixo}roleta 1 vermelho\`\n` +
+            `🐯 Tigrinho: \`${config.prefixo}tigrinho 1\``,
+            [sender]
+        );
+    }
+
+    if (['bonus', 'bônus', 'daily'].includes(comando)) {
+        return reply(
+            `🚫 *Não tem bônus diário.*\n\n` +
+            `As fichas só voltam recruitedando gente:\n` +
+            `\`${config.prefixo}convidar @pessoa1 @pessoa2\``,
+            [sender]
+        );
+    }
+
+    if (['roleta', 'roleta', 'roulette', 'giro'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const valor = parseInt(args[0]);
+        const escolha = (args[1] || '').toLowerCase();
+        if (!valor || valor < config.apostaMinima) {
+            return reply(`Uso: ${config.prefixo}roleta <aposta> <vermelho|preto|par|impar|baixo|alto|N 1-36>`);
+        }
+        const dados = carregarJson(CASSINO_PATH);
+        const saldo = saldoDe(dados, jid, sender);
+        if (saldo < valor) return reply(avisoSemSaldo(saldo) + `\n\n_(aposta pedida: ${valor.toLocaleString('pt-BR')})_`);
+        definirSaldo(dados, jid, sender, saldo - valor);
+
+        const numero = Math.floor(Math.random() * 37);
+        const cor = numero === 0 ? 'verde' : VERMELHOS.has(numero) ? 'vermelho' : 'preto';
+        const par = numero !== 0 && numero % 2 === 0;
+
+        let ganhou = false, premio = 0, descricao = '';
+        if (escolha === 'vermelho' || escolha === 'vermelha' || escolha === 'red') {
+            ganhou = cor === 'vermelho'; premio = valor * 2;
+            descricao = 'vermelho';
+        } else if (escolha === 'preto' || escolha === 'preta' || escolha === 'black') {
+            ganhou = cor === 'preto'; premio = valor * 2;
+            descricao = 'preto';
+        } else if (escolha === 'par') {
+            ganhou = par; premio = valor * 2; descricao = 'par';
+        } else if (escolha === 'impar' || escolha === 'ímpar') {
+            ganhou = numero !== 0 && !par; premio = valor * 2; descricao = 'ímpar';
+        } else if (escolha === 'baixo' || escolha === '1-18' || escolha === '1a18') {
+            ganhou = numero >= 1 && numero <= 18; premio = valor * 2; descricao = '1 a 18';
+        } else if (escolha === 'alto' || escolha === '19-36' || escolha === '19a36') {
+            ganhou = numero >= 19 && numero <= 36; premio = valor * 2; descricao = '19 a 36';
+        } else if (/^\d{1,2}$/.test(escolha)) {
+            const alvo = parseInt(escolha);
+            ganhou = numero === alvo; premio = valor * 36;
+            descricao = `número ${alvo}`;
+        } else {
+            return reply('❌ Aposta inválida. Use: vermelho, preto, par, impar, baixo, alto ou um número de 0 a 36.');
+        }
+
+        let saldoFinal = saldo - valor;
+        if (ganhou) { premio = Math.floor(premio); saldoFinal += premio; }
+        definirSaldo(dados, jid, sender, saldoFinal);
+        fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+
+        const bola = cor === 'verde' ? '🟢' : cor === 'vermelho' ? '🔴' : '⚫';
+        const cab = ganhou
+            ? `🎉 *GANHOU!* +${premio.toLocaleString('pt-BR')} fichas`
+            : `💀 Perdeu ${valor.toLocaleString('pt-BR')} fichas`;
+        return reply(
+            `🎰 *ROLETA* ${bola} ${numero} ${cor.toUpperCase()}\n\n` +
+            `🎯 Aposta: ${descricao} • ${valor.toLocaleString('pt-BR')}\n` +
+            `${cab}\n` +
+            `💰 Saldo: *${saldoFinal.toLocaleString('pt-BR')}*`,
+            [sender]
+        );
+    }
+
+    if (['tigrinho', 'tigre', 'slot', 'caça', 'caca'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const valor = parseInt(args[0]);
+        if (!valor || valor < config.apostaMinima) {
+            return reply(`Uso: ${config.prefixo}tigrinho <aposta>\nMínimo: ${config.apostaMinima} fichas`);
+        }
+        const dados = carregarJson(CASSINO_PATH);
+        const saldo = saldoDe(dados, jid, sender);
+        if (saldo < valor) return reply(avisoSemSaldo(saldo) + `\n\n_(aposta pedida: ${valor.toLocaleString('pt-BR')})_`);
+        definirSaldo(dados, jid, sender, saldo - valor);
+
+        const rolo = girarTigrinho();
+        const [a, b, c] = rolo;
+        let premio = 0, msg = '';
+        if (a.e === b.e && b.e === c.e) {
+            premio = valor * a.trio;
+            msg = `💎 *TRINCA DE ${a.e}*! ${a.trio}x`;
+        } else if (a.e === b.e || b.e === c.e || a.e === c.e) {
+            const par = a.e === b.e ? a : b.e === c.e ? b : a;
+            premio = valor * par.par;
+            msg = `✨ *Par de ${par.e}*! ${par.par}x`;
+        }
+        let saldoFinal = saldo - valor + premio;
+        definirSaldo(dados, jid, sender, saldoFinal);
+
+        // Ranking de maiores prêmios do tigrinho (top 10 por grupo)
+        let novoRecorde = false;
+        if (premio > 0) {
+            if (!dados.records) dados.records = {};
+            if (!dados.records[jid]) dados.records[jid] = { tigrinho: [] };
+            const tab = dados.records[jid].tigrinho;
+            const anterior = tab[0]?.premio || 0;
+            tab.push({ user: sender, premio, aposta: valor });
+            tab.sort((x, y) => y.premio - x.premio);
+            dados.records[jid].tigrinho = tab.slice(0, 10);
+            novoRecorde = premio > anterior;
+        }
+
+        fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+
+        const primeiro = novoRecorde;
+        return reply(
+            `🐯 *TIGRINHO*\n\n` +
+            `\`${a.e} │ ${b.e} │ ${c.e}\`\n\n` +
+            (premio > 0 ? `🎉 *GANHOU!* +${premio.toLocaleString('pt-BR')}* fichas\n${msg}\n` : `💀 Perdeu ${valor.toLocaleString('pt-BR')}*\n`) +
+            (primeiro ? `\n🥇 *NOVO RECORDE DO TIGRINHO!*\n` : '') +
+            `💰 Saldo: *${saldoFinal.toLocaleString('pt-BR')}*`,
+            [sender]
+        );
+    }
+
+    if (['convidar', 'recrutar', 'convite'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const precisa = config.convidadosNecessarios ?? 2;
+        const porConv = config.fichasPorConvidado ?? 10;
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const marcados = ctx?.mentionedJid || [];
+
+        if (marcados.length < precisa) {
+            return reply(
+                `🎁 *Recrute para ganhar fichas!*\n\n` +
+                `Marque *${precisa} pessoas* e envie:\n` +
+                `\`${config.prefixo}convidar @pessoa1 @pessoa2\`\n\n` +
+                `Ganhe *${porConv * precisa} fichas* por cada ${precisa} recruitados.`
+            );
+        }
+
+        const dados = carregarJson(CASSINO_PATH);
+        const reg = carregarJson(CONVITES_PATH);
+        const validos = [];
+        const invalidos = [];
+
+        for (const bruto of marcados.slice(0, precisa)) {
+            const u = chaveCanonica(jid, bruto, metadata.participants);
+            if (u === sender) { invalidos.push('você mesmo'); continue; }
+            if (u === sock.user.id) { invalidos.push('o bot'); continue; }
+            if (ehProtegido(sock, u, metadata.participants)) { invalidos.push(`@${semSufixo(u)} (admin/dono)`); continue; }
+            if (!acharParticipante(metadata.participants, u)) { invalidos.push(`@${semSufixo(u)} (não está no grupo)`); continue; }
+            if (foiConvidado(reg, jid, u)) { invalidos.push(`@${semSufixo(u)} (já foi recruitado)`); continue; }
+            if (validos.includes(u)) { invalidos.push(`@${semSufixo(u)} (repetido)`); continue; }
+            validos.push(u);
+        }
+
+        if (!validos.length) {
+            return reply(
+                `❌ *Nenhuma pessoa válida pra contar:*\n\n` +
+                invalidos.map(x => `• ${x}`).join('\n') +
+                `\n\n_convite_: precisa ser alguém *novo* no grupo e que não seja admin.`
+            );
+        }
+
+        for (const u of validos) marcarConvidado(reg, jid, u, sender);
+        fs.writeFileSync(CONVITES_PATH, JSON.stringify(reg, null, 2));
+
+        const ganho = validos.length * porConv;
+        const saldo = saldoDe(dados, jid, sender);
+        const saldoFinal = definirSaldo(dados, jid, sender, saldo + ganho);
+        fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+
+        let out = `🎉 *RECRUTAMENTO CONCLUÍDO!*\n\n` +
+            validos.map(u => `✅ @${semSufixo(u)}`).join('\n') + '\n\n' +
+            `🎁 *+${ganho.toLocaleString('pt-BR')} fichas*\n` +
+            `💰 Saldo: *${saldoFinal.toLocaleString('pt-BR')}*`;
+
+        if (invalidos.length) {
+            out += `\n\n_ignorados: ${invalidos.map(x => `\`${x}\``).join(', ')}_\n` +
+                `_(só valem ${precisa} por comando)_`;
+        }
+        return reply(out, [sender, ...validos]);
+    }
+
+    if (['recordes', 'recordes-tigrinho', 'hi-scores'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const dados = carregarJson(CASSINO_PATH);
+        const lista = (dados.records?.[jid]?.tigrinho || []).slice(0, 10);
+        if (!lista.length) {
+            return reply(`🐯 *NINGUÉM BATEU RECORDE AINHOUR*\n\nJogue ${config.prefixo}tigrinho ${config.apostaMinima} e apareça aqui! 🥇`);
+        }
+        const medalhas = ['🥇', '🥈', '🥉'];
+        let out = `🐯 *MAIORES GANHOS NO TIGRINHO* 🐯\n\n` +
+            `🎰 Aposta mínima: ${config.apostaMinima} fichas\n\n`;
+        lista.forEach((r, i) => {
+            out += `${medalhas[i] || `${i + 1}º`} @${semSufixo(r.user)} — *${r.premio.toLocaleString('pt-BR')}* fichas\n` +
+                `   _com aposta de ${r.aposta.toLocaleString('pt-BR')}_\n\n`;
+        });
+        return reply(out);
+    }
+
+    if (['ranking', 'top', 'topcassino'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const dados = carregarJson(CASSINO_PATH);
+        const lista = Object.entries(dados[jid] || {})
+            .sort((a, b) => b[1] - a[1])
+            .slice(0, 10);
+        if (!lista.length) return reply('🎰 Ninguém jogou ainda. Começa com `!roleta 10 vermelho`!');
+        const medalhas = ['🥇', '🥈', '🥉'];
+        let out = '🏆 *RANKING DO CASSINO*\n\n';
+        lista.forEach(([u, v], i) => {
+            out += `${medalhas[i] || `${i + 1}.`} @${semSufixo(u)} — *${v.toLocaleString('pt-BR')}*\n`;
+        });
+        return reply(out);
+    }
+
+    if (['dar', 'darficha', 'addficha'].includes(comando)) {
+        if (!isAdmin) return reply('❌ Só admins podem dar fichas.');
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const alvoBruto = ctx?.mentionedJid?.[0] || ctx?.participant;
+        if (!alvoBruto) return reply(`Uso: ${config.prefixo}dar @usuario <valor>`);
+        const alvo = chaveCanonica(jid, alvoBruto, metadata.participants);
+        const valor = parseInt(args[0]);
+        if (!valor || valor <= 0) return reply(`Uso: ${config.prefixo}dar @usuario <valor>`);
+        const dados = carregarJson(CASSINO_PATH);
+        const novo = saldoDe(dados, jid, alvo) + valor;
+        definirSaldo(dados, jid, alvo, novo);
+        fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+        return reply(`🎁 @${semSufixo(alvo)} recebeu *${valor.toLocaleString('pt-BR')}* fichas. Saldo: *${novo.toLocaleString('pt-BR')}*`, [alvo]);
+    }
+
+    if (['cassino', 'casino'].includes(comando)) {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        const opt = args[0]?.toLowerCase();
+        if (opt === 'on') config.cassinoAtivo = true;
+        else if (opt === 'off') config.cassinoAtivo = false;
+        else return reply(`Uso: ${config.prefixo}cassino on/off (atual: ${config.cassinoAtivo ? 'ABERTO' : 'FECHADO'})`);
+        salvarConfig();
+        return reply(`🎰 Cassino ${config.cassinoAtivo ? 'ABERTO' : 'FECHADO'}.`);
+    }
+
     if (comando === 'ping') {
         return reply('🏓 Pong! Bot online.');
     }
@@ -890,9 +1197,8 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
     if (comando === 'status') {
         return reply(
             `🩺 Status do bot\n` +
-            `Palavras: ${config.palavrasProibidas.length} | Antilink: ${config.antilink ? 'ON' : 'OFF'} | ` +
-            `View-once: ${config.bloquearViewOnce ? 'ON' : 'OFF'}\n` +
-            `Dry-run: ${config.dryRun ? 'ON' : 'OFF'}\n` +
+            `Palavras: ${config.palavrasProibidas.length} | Antilink: ${config.antilink ? 'ON' : 'OFF'}\n` +
+            `Cassino: ${config.cassinoAtivo ? 'ABERTO' : 'FECHADO'}\n` +
             `Sou admin aqui: ${isBotAdmin ? 'sim' : 'NÃO'}${isBotAdmin ? '' : ' (não apago nem bano)'}\n` +
             `Ignorar admins: ${config.ignorarAdmins ? 'ON' : 'OFF'} | Ignorar dono: ${config.ignorarDono ? 'ON' : 'OFF'}`
         );
@@ -908,14 +1214,21 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
             `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
             `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +
-            `🕵️ \`${config.prefixo}viewonce on/off\` - Bloqueia mídia "ver uma vez"\n` +
-            `🧪 \`${config.prefixo}dryrun on/off\` - Só loga, não apaga\n` +
             `🗑️ \`${config.prefixo}apagar\` - Apaga a mensagem respondida\n` +
             `🔞 \`${config.prefixo}+18\` - Apaga foto/vídeo + advertência\n` +
             `♻️ \`${config.prefixo}zerar @usuario\` - Zera advertências\n` +
             `🚫 \`${config.prefixo}ban\` - Bane (marca ou responde a msg)\n` +
             `🗑️ \`${config.prefixo}limpar\` - Apaga mensagens do bot\n` +
             `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
+            `\n` +
+            `🎰 *CASSINO* 🎰\n` +
+            `💰 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
+            `🎁 \`${config.prefixo}convidar @a @b\` - Traga 2 novos (+10 cada)\n` +
+            `🎡 \`${config.prefixo}roleta <aposta> <aposta>\` - Roleta russa\n` +
+            `🐯 \`${config.prefixo}tigrinho <aposta>\` - Caça-níquel\n` +
+            `🏆 \`${config.prefixo}recordes\` - Maiores premios do tigrinho\n` +
+            `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
+            `🎁 \`${config.prefixo}dar @usuario <valor>\` - Dá fichas (ADMs)\n` +
             `\n` +
             `📡 *GERAL* 📡\n` +
             `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
@@ -932,6 +1245,14 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
             `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
             `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
+            `\n` +
+            `🎰 *CASSINO* 🎰\n` +
+            `💰 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
+            `🎁 \`${config.prefixo}convidar @a @b\` - Traga 2 novos (+10 cada)\n` +
+            `🎡 \`${config.prefixo}roleta <aposta> <aposta>\` - Roleta russa\n` +
+            `🐯 \`${config.prefixo}tigrinho <aposta>\` - Caça-níquel\n` +
+            `🏆 \`${config.prefixo}recordes\` - Maiores premios do tigrinho\n` +
+            `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
             `\n` +
             `📡 *GERAL* 📡\n` +
             `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
