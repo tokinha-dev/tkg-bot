@@ -4,30 +4,180 @@ import fs from 'node:fs';
 import pino from 'pino';
 
 const CONFIG_PATH = './config.json';
-let config = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8'));
+const WARNINGS_PATH = './warnings.json';
+const RANK_PATH = './rank.json';
+const AUTH_FOLDER = './auth_info';
 
 const NOME_BOT_FANCY = '𝐟𝐚𝐦𝐢𝐥𝐢𝐚-𝟏𝟓𝟕-𝐛𝐨𝐭';
 
 const mensagensBot = {};
 
-const WARNINGS_PATH = './warnings.json';
-const RANK_PATH = './rank.json';
-const AUTH_FOLDER = './auth_info';
+// ====================== CONFIG ======================
+function aplicarPadroes(c) {
+    c.nomeBot ??= 'bot';
+    c.prefixo ??= '!';
+    c.maxAdvertencias ??= 3;
+    c.acaoAposMax ??= 'remover';
+    c.mensagemAdvertencia ??= 'mensagem não permitida! ⚠️ Advertência {atual}/{max}';
+    c.antilink ??= true;
+    c.palavrasProibidas ??= [];
+    c.linkRegex ??= [];
+    c.gruposPermitidos ??= [];
+    c.ignorarAdmins ??= true;
+    c.ignorarDono ??= true;
+    c.donos ??= [];
+    c.dryRun ??= false;
+    c.bloquearViewOnce ??= false;
+    c.cacheMetadataMs ??= 30000;
+    return c;
+}
 
-// --- Persistência de advertências ---
+let config = aplicarPadroes(JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf-8')));
+
+function salvarConfig() {
+    fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+}
+
+// ====================== TEXTO / NORMALIZAÇÃO ======================
+function normalizar(texto) {
+    return String(texto || '')
+        .toLowerCase()
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function escaparRegex(txt) {
+    return txt.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function digitos(valor) {
+    return String(valor || '').replace(/\D/g, '');
+}
+
+function semSufixo(jid) {
+    return String(jid || '').split('@')[0];
+}
+
+// Constrói o "corpo" tolerante: espaço vira \s+, hífen vira separador opcional
+function nucleoPalavra(palavra) {
+    let s = palavra.replace(/\s+/g, '\u0000');
+    s = escaparRegex(s);
+    s = s.replace(/-/g, '[\\s_-]?');
+    s = s.replace(/\u0000/g, '\\s+');
+    return s;
+}
+
+const cachePadroes = new Map();
+
+/**
+ * Regras de casamento (evita o `includes()` que quebrava tudo):
+ *   "pix"        -> palavra inteira        (NÃO pega "pixel", "fiz o pix" só se a palavra for "pix")
+ *   "a se morreu"-> frase exata
+ *   "*link*"     -> contém em qualquer lugar (comportamento antigo, use com cuidado)
+ *   "^vk"        -> começa com
+ *   "video$"     -> termina com
+ *   "a.c"        -> literal (o ponto é escapado automaticamente)
+ */
+function regexPalavraProibida(palavra) {
+    if (cachePadroes.has(palavra)) return cachePadroes.get(palavra);
+
+    const p = normalizar(palavra);
+    let re = null;
+
+    if (p) {
+        const comCuringa = p.includes('*');
+        const inicio = p.startsWith('^');
+        const fim = p.endsWith('$') && p.length > 1;
+
+        let corpo = p;
+        if (inicio) corpo = corpo.slice(1);
+        if (fim) corpo = corpo.slice(0, -1);
+        corpo = corpo.replace(/\*/g, '').replace(/\s+/g, ' ').trim();
+
+        if (corpo) {
+            const nuc = nucleoPalavra(corpo);
+            const palavraSimples = !corpo.includes(' ');
+            const bordaEsq = '(?<![\\p{L}\\p{N}])';
+            const bordaDir = '(?![\\p{L}\\p{N}])';
+
+            let padrao;
+            if (comCuringa && palavraSimples) padrao = `\\p{L}*${nuc}[\\p{L}\\p{N}]*`;
+            else if (comCuringa) padrao = nuc;
+            else if (inicio) padrao = `${bordaEsq}${nuc}${bordaDir}`;
+            else if (fim) padrao = `${bordaEsq}\\p{L}*${nuc}${bordaDir}`;
+            else padrao = `${bordaEsq}${nuc}${bordaDir}`;
+
+            try {
+                re = new RegExp(padrao, 'iu');
+            } catch {
+                re = null;
+            }
+        }
+    }
+
+    cachePadroes.set(palavra, re);
+    return re;
+}
+
+function contemLink(texto) {
+    for (const pattern of config.linkRegex) {
+        try {
+            if (new RegExp(pattern, 'i').test(texto)) return pattern;
+        } catch { /* padrão inválido é ignorado */ }
+    }
+    return null;
+}
+
+function contemConteudoProibido(texto) {
+    if (!texto) return { proibido: false };
+
+    if (config.antilink) {
+        const link = contemLink(texto);
+        if (link) return { proibido: true, motivo: `link (${link})` };
+    }
+
+    const alvo = normalizar(texto);
+    for (const palavra of config.palavrasProibidas) {
+        const re = regexPalavraProibida(palavra);
+        if (re && re.test(alvo)) return { proibido: true, motivo: `palavra: "${palavra}"` };
+    }
+
+    return { proibido: false };
+}
+
+function validarPadroesLink() {
+    const suspeitos = [];
+    for (const p of config.linkRegex) {
+        if (/(^|[^\\])[.]\p{L}/u.test(p)) {
+            const seguro = /^(https?:\/\/|www)\.?\/?$/u.test(p);
+            if (!seguro) suspeitos.push(p);
+        }
+    }
+    if (suspeitos.length) {
+        console.log(' [!] linkRegex com ponto NÃO escapado (vira coringa e apaga texto inocente):', suspeitos.join(', '));
+        console.log('     Ex.: "t\\.me" e NÃO "t.me"');
+    }
+}
+
+// ====================== PERSISTÊNCIA ======================
 function carregarWarnings() {
     if (!fs.existsSync(WARNINGS_PATH)) {
         fs.writeFileSync(WARNINGS_PATH, JSON.stringify({}, null, 2));
         return {};
     }
-    return JSON.parse(fs.readFileSync(WARNINGS_PATH, 'utf-8'));
+    try {
+        return JSON.parse(fs.readFileSync(WARNINGS_PATH, 'utf-8'));
+    } catch {
+        return {};
+    }
 }
 
 function salvarWarnings(data) {
     fs.writeFileSync(WARNINGS_PATH, JSON.stringify(data, null, 2));
 }
 
-// --- Persistência de ranking ---
 function carregarRank() {
     if (!fs.existsSync(RANK_PATH)) {
         fs.writeFileSync(RANK_PATH, JSON.stringify({}, null, 2));
@@ -35,62 +185,257 @@ function carregarRank() {
     }
     return JSON.parse(fs.readFileSync(RANK_PATH, 'utf-8'));
 }
+
 function salvarRank(data) {
     fs.writeFileSync(RANK_PATH, JSON.stringify(data, null, 2));
 }
 
 function getTextoMensagem(msg) {
+    const m = msg.message;
+    if (!m) return '';
+    if (m.ephemeralMessage?.message) return getTextoMensagem({ message: m.ephemeralMessage.message });
+    if (m.viewOnceMessage?.message) return getTextoMensagem({ message: m.viewOnceMessage.message });
+    if (m.viewOnceMessageV2?.message) return getTextoMensagem({ message: m.viewOnceMessageV2.message.message || m.viewOnceMessageV2.message });
+    if (m.viewOnceMessageV2Extension?.message) return getTextoMensagem({ message: m.viewOnceMessageV2Extension.message });
+    if (m.buttonsMessage?.contentText) return m.buttonsMessage.contentText;
+    if (m.templateMessage?.hydratedTemplate?.hydratedContentText) return m.templateMessage.hydratedTemplate.hydratedContentText;
+    if (m.listMessage?.description) return m.listMessage.description;
+    if (m.pollCreationMessage?.name) return m.pollCreationMessage.name;
     return (
-        msg.message?.conversation ||
-        msg.message?.extendedTextMessage?.text ||
-        msg.message?.imageMessage?.caption ||
-        msg.message?.videoMessage?.caption ||
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
         ''
     );
 }
 
-// --- Identidade anti-LID: prefere o número de telefone (PN) ---
-function getSender(msg, jid) {
-    return msg.key.senderPn || msg.key.participant || msg.participant || jid;
+// ====================== IDENTIDADE (LID <-> PN) ======================
+let sockAtual = null;
+const cacheMetadata = new Map();
+const aliasPorGrupo = new Map(); // jid -> Map(chave -> [aliases])
+
+async function pegarMetadata(sock, jid) {
+    const cached = cacheMetadata.get(jid);
+    if (cached && Date.now() - cached.ts < config.cacheMetadataMs) return cached.data;
+    const data = await sock.groupMetadata(jid);
+    cacheMetadata.set(jid, { data, ts: Date.now() });
+    return data;
+}
+
+function registrarAliases(jid, participants) {
+    const mapa = new Map();
+    for (const p of participants || []) {
+        const chaves = [p.id, p.lid, p.phoneNumber].filter(Boolean);
+        for (const c of chaves) mapa.set(semSufixo(c), chaves);
+    }
+    aliasPorGrupo.set(jid, mapa);
+    return mapa;
+}
+
+function aliasesDe(jid, ref) {
+    if (!ref) return [];
+    const mapa = aliasPorGrupo.get(jid);
+    const achado = mapa?.get(semSufixo(ref));
+    return achado ? achado.filter(x => x !== ref) : [];
+}
+
+function acharParticipante(participants, ref) {
+    if (!ref) return null;
+    const base = semSufixo(ref);
+    const num = digitos(ref);
+    return (
+        participants.find(p =>
+            p.id === ref || p.lid === ref || p.phoneNumber === ref ||
+            semSufixo(p.id) === base ||
+            (p.lid && semSufixo(p.lid) === base) ||
+            (p.phoneNumber && semSufixo(p.phoneNumber) === base)
+        ) ||
+        (num
+            ? participants.find(p =>
+                (p.phoneNumber && digitos(p.phoneNumber) === num) ||
+                (p.id && digitos(p.id) === num && p.id.includes('@s.whatsapp.net'))
+            )
+            : null) ||
+        null
+    );
 }
 
 function ehAdmin(participants, jid) {
-    const p = participants.find(x => x.id === jid || x.phoneNumber === jid || x.lid === jid);
-    return p?.admin === 'admin' || p?.admin === 'superadmin';
+    const p = acharParticipante(participants, jid);
+    if (!p) return false;
+    return p.admin === 'admin' || p.admin === 'superadmin';
 }
 
-function contemConteudoProibido(texto) {
-    if (!texto) return { proibido: false };
+/** Chave canônica de advertência: sempre o mesmo id, mesmo se o WA mandar PN ou LID. */
+function chaveCanonica(jid, sender, participants) {
+    const p = acharParticipante(participants, sender);
+    return p?.id || sender;
+}
 
-    const textoLower = texto.toLowerCase();
+function ehProtegido(sock, sender, participants) {
+    if (!sender) return true;
+    const botId = sock.user?.id;
+    const botLid = sock.user?.lid;
+    if (sender === botId || sender === botLid) return true;
+    if (botId && semSufixo(sender) === semSufixo(botId)) return true;
 
-    // Verifica links se antilink ativo
-    if (config.antilink) {
-        for (const pattern of config.linkRegex) {
-            const regex = new RegExp(pattern, 'i');
-            if (regex.test(texto)) {
-                return { proibido: true, motivo: 'link' };
+    if (config.ignorarDono && config.donos?.length) {
+        const num = digitos(sender);
+        if (!num) return true;
+        const meu = digitos(botId || botLid);
+        if (config.donos.some(d => digitos(d) === num) || (meu && num === meu)) return true;
+    }
+
+    if (config.ignorarAdmins && ehAdmin(participants, sender)) return true;
+
+    return false;
+}
+
+// ====================== AÇÕES DE MODERAÇÃO ======================
+async function apagarMensagem(sock, jid, key) {
+    if (!key?.id) return { ok: false, erro: 'mensagem sem id' };
+    try {
+        await sock.sendMessage(jid, { delete: key });
+        return { ok: true };
+    } catch (e) {
+        return { ok: false, erro: e.message };
+    }
+}
+
+/** Reconhece o tipo de mídia, desembrulhando view-once/efêmera. */
+function tipoDaMidia(m) {
+    if (!m) return null;
+    const embrulho =
+        m.viewOnceMessage?.message ||
+        m.viewOnceMessageV2?.message?.message ||
+        m.viewOnceMessageV2?.message ||
+        m.viewOnceMessageV2Extension?.message ||
+        m.ephemeralMessage?.message;
+    if (embrulho && embrulho !== m) return tipoDaMidia(embrulho);
+    if (m.imageMessage) return m.imageMessage.viewOnce ? 'imagem-efemera' : 'imagem';
+    if (m.videoMessage) return m.videoMessage.viewOnce ? 'video-efemero' : 'video';
+    if (m.stickerMessage) return 'figurinha';
+    if (m.audioMessage) return 'audio';
+    if (m.documentMessage) return 'documento';
+    if (m.contactMessage) return 'contato';
+    if (m.locationMessage || m.liveLocationMessage) return 'localizacao';
+    if (m.pollCreationMessage) return 'enquete';
+    if (m.conversation || m.extendedTextMessage) return 'texto';
+    return null;
+}
+
+const TIPOS_MIDIA = ['imagem', 'imagem-efemera', 'video', 'video-efemero', 'figurinha', 'documento'];
+
+/** Monta a key da mensagem citada, com o participant (sem isso o WhatsApp recusa). */
+function chaveCitada(ctx, jid) {
+    if (!ctx?.stanzaId) return null;
+    return { remoteJid: jid, id: ctx.stanzaId, fromMe: false, participant: ctx.participant || undefined };
+}
+
+/**
+ * Fluxo único de punição: apaga -> conta advertência -> avisa -> bane no limite.
+ * Se `key` for null, só conta advertência (sem apagar nada).
+ */
+async function aplicarAdvertencia(sock, jid, alvo, motivo, key) {
+    console.log(` [DETECTADO] ${alvo} (${digitos(alvo) || semSufixo(alvo)}) | motivo: ${motivo}`);
+
+    if (config.dryRun) {
+        console.log('  -> dryRun: não apagou, não advertiu');
+        return { apagada: false, atual: 0, dryRun: true };
+    }
+
+    if (key) {
+        const r = await apagarMensagem(sock, jid, key);
+        if (r.ok) {
+            console.log('  -> Mensagem apagada');
+        } else {
+            console.log('  -> Erro ao apagar (bot precisa ser admin):', r.erro);
+            return { apagada: false, erro: r.erro, atual: 0 };
+        }
+    }
+
+    const warnings = carregarWarnings();
+    if (!warnings[jid]) warnings[jid] = {};
+    unificarWarnings(warnings, jid, alvo, aliasesDe(jid, alvo));
+    warnings[jid][alvo] = (warnings[jid][alvo] || 0) + 1;
+    const atual = warnings[jid][alvo];
+    salvarWarnings(warnings);
+
+    let texto = config.mensagemAdvertencia
+        .replace('{atual}', atual)
+        .replace('{max}', config.maxAdvertencias);
+
+    if (atual === config.maxAdvertencias - 1) {
+        texto += `\n\n⚠️ *NA PRÓXIMA VAI LEVAR BAN!*`;
+    }
+
+    await sock.sendMessage(jid, {
+        text: `⛔ @${semSufixo(alvo)} ${texto}`,
+        mentions: [alvo]
+    });
+
+    if (atual >= config.maxAdvertencias) {
+        if (config.acaoAposMax === 'remover') {
+            await new Promise(r => setTimeout(r, 1000));
+            try {
+                await sock.groupParticipantsUpdate(jid, [alvo], 'remove');
+                await sock.sendMessage(jid, {
+                    text: `🚫 @${semSufixo(alvo)} removido após ${config.maxAdvertencias} advertências.`,
+                    mentions: [alvo]
+                });
+                console.log(`  -> Usuário ${alvo} removido`);
+            } catch (e) {
+                console.log('  -> Erro ao remover usuário (bot precisa ser admin):', e.message);
             }
         }
+        warnings[jid][alvo] = 0;
+        salvarWarnings(warnings);
     }
 
-    // Verifica palavras proibidas
-    for (const palavra of config.palavrasProibidas) {
-        if (textoLower.includes(palavra.toLowerCase())) {
-            return { proibido: true, motivo: `palavra: ${palavra}` };
-        }
-    }
-
-    return { proibido: false };
+    return { apagada: true, atual };
 }
 
+// ====================== ANTI-DUPLICIDADE ======================
+const processados = new Set();
+const filaProcessados = [];
+
+function jaProcessou(key) {
+    const id = `${key.remoteJid}|${key.id}|${key.participant || ''}`;
+    if (processados.has(id)) return true;
+    processados.add(id);
+    filaProcessados.push(id);
+    if (filaProcessados.length > 2000) processados.delete(filaProcessados.shift());
+    return false;
+}
+
+/** Mescla contadores gravados sob chaves LID/PN diferentes (o WA alterna entre os dois). */
+function unificarWarnings(warnings, jid, canonica, aliases) {
+    if (!warnings[jid]) return 0;
+    let maior = warnings[jid][canonica] || 0;
+    for (const a of aliases) {
+        if (a === canonica) continue;
+        maior = Math.max(maior, warnings[jid][a] || 0);
+        delete warnings[jid][a];
+    }
+    warnings[jid][canonica] = maior;
+    return maior;
+}
+
+// ====================== BOT ======================
 async function iniciarBot() {
-    // --- Restaura sessão via variável de ambiente (hospedagem) ---
+    // Mata o socket anterior para não duplicar listeners (banho de advertência em cascata)
+    if (sockAtual?.ev) {
+        try { sockAtual.ev.removeAllListeners(); } catch { /* noop */ }
+        try { sockAtual.ws?.close(); } catch { /* noop */ }
+        sockAtual = null;
+    }
+
     if (process.env.AUTH_B64) {
         try {
             if (!fs.existsSync(AUTH_FOLDER)) fs.mkdirSync(AUTH_FOLDER, { recursive: true });
             const credsJson = Buffer.from(process.env.AUTH_B64, 'base64').toString('utf-8');
-            JSON.parse(credsJson); // valida
+            JSON.parse(credsJson);
             fs.writeFileSync(`${AUTH_FOLDER}/creds.json`, credsJson);
             console.log(' Sessão restaurada via AUTH_B64');
         } catch (e) {
@@ -106,12 +451,15 @@ async function iniciarBot() {
         version,
         auth: state,
         logger: pino({ level: 'silent' }),
-        printQRInTerminal: false
+        printQRInTerminal: false,
+        getMessage: async () => undefined
     });
+    sockAtual = sock;
+
+    validarPadroesLink();
 
     sock.ev.on('creds.update', saveCreds);
 
-    // --- Pareamento por código: pede quando a conexão já está aberta (evento qr) ---
     const numeroPareamento = String(process.env.NUMERO_BOT || config.numeroBot || '').replace(/\D/g, '');
     let pareamentoSolicitado = false;
 
@@ -119,7 +467,6 @@ async function iniciarBot() {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            // Se tem número configurado e NENHUMA identidade ainda, usa código de pareamento (conexão já aberta aqui)
             const semIdentidade = !sock.authState.creds.me;
             if (numeroPareamento && semIdentidade && !sock.authState.creds.registered && !pareamentoSolicitado) {
                 pareamentoSolicitado = true;
@@ -138,8 +485,9 @@ async function iniciarBot() {
         }
 
         if (connection === 'open') {
+            cacheMetadata.clear();
             console.log(`\n Bot "${config.nomeBot}" conectado com sucesso!`);
-            console.log(` Prefixo: ${config.prefixo} | Max advertências: ${config.maxAdvertencias}`);
+            console.log(` Prefixo: ${config.prefixo} | Max advertências: ${config.maxAdvertencias} | Dry-run: ${config.dryRun ? 'ON' : 'OFF'}`);
         }
 
         if (connection === 'close') {
@@ -148,14 +496,17 @@ async function iniciarBot() {
             console.log(` Conexão fechada. status=${statusCode} erro=${errMsg}`);
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
             console.log(' Reconectando:', shouldReconnect);
-            if (shouldReconnect) iniciarBot();
+            if (shouldReconnect) {
+                setTimeout(() => iniciarBot().catch(e => console.log('Erro ao reconectar:', e.message)), 3000);
+            }
         }
     });
 
-    // --- Boas-vindas com foto de perfil ---
     sock.ev.on('group-participants.update', async (update) => {
         try {
             const { id, participants, action } = update;
+            cacheMetadata.delete(id);
+            aliasPorGrupo.delete(id);
             if (action !== 'add') return;
 
             const metadata = await sock.groupMetadata(id);
@@ -172,7 +523,7 @@ async function iniciarBot() {
                 const texto =
                     `*🎉 BEM-VINDO(A) À FAMÍLIA!* 🎉\n` +
                     `\n` +
-                    `𝐅𝐀𝐌𝐈𝐋𝐈𝐀 𝟏𝟕𝟏🃏\n` +
+                    `𝐅𝐀𝐌𝐈𝐋𝐈𝐀 𝟏𝟓𝟕🃏\n` +
                     `\n` +
                     `👋 @${nome} entrou no grupo *${groupName}*\n` +
                     `\n` +
@@ -185,10 +536,7 @@ async function iniciarBot() {
                         mentions: [participant]
                     });
                 } else {
-                    await sock.sendMessage(id, {
-                        text: texto,
-                        mentions: [participant]
-                    });
+                    await sock.sendMessage(id, { text: texto, mentions: [participant] });
                 }
                 console.log(` [BOAS-VINDAS] ${participant} em ${id}`);
             }
@@ -200,7 +548,6 @@ async function iniciarBot() {
     sock.ev.on('messages.upsert', async ({ messages }) => {
         for (const msg of messages) {
             try {
-                // Guarda as mensagens enviadas pelo bot pra poder limpar depois
                 if (msg.key.fromMe && msg.key.remoteJid) {
                     const jidBot = msg.key.remoteJid;
                     if (!mensagensBot[jidBot]) mensagensBot[jidBot] = [];
@@ -211,90 +558,45 @@ async function iniciarBot() {
 
                 if (!msg.message) continue;
 
-                const jid = msg.key.remoteJid;
-                const isGroup = jid.endsWith('@g.us');
-                if (!isGroup) continue; // só atua em grupos
+                // O WA reenvia mensagens antigas no reconnect -> contava advertência 2x
+                if (jaProcessou(msg.key)) continue;
 
-                // Filtro de grupos permitidos (se configurado)
+                const jid = msg.key.remoteJid;
+                if (!jid || !jid.endsWith('@g.us')) continue;
+
                 if (config.gruposPermitidos.length > 0 && !config.gruposPermitidos.includes(jid)) continue;
 
                 const texto = getTextoMensagem(msg);
+                const senderBruto = msg.key.participant || msg.key.senderPn || msg.participant;
+                if (!senderBruto) continue;
+
+                const metadata = await pegarMetadata(sock, jid);
+                registrarAliases(jid, metadata.participants);
+
+                const sender = chaveCanonica(jid, senderBruto, metadata.participants);
+
+                // Mídia "ver uma vez" é o esconderijo clássico de conteúdo adulto
+                if (!texto && config.bloquearViewOnce) {
+                    const tipo = tipoDaMidia(msg.message);
+                    if ((tipo === 'imagem-efemera' || tipo === 'video-efemero') && !ehProtegido(sock, sender, metadata.participants)) {
+                        await aplicarAdvertencia(sock, jid, sender, `${tipo} (view once)`, msg.key);
+                        continue;
+                    }
+                }
+
                 if (!texto) continue;
 
-                const sender = getSender(msg, jid);
-
-                // --- Comandos ---
                 if (texto.startsWith(config.prefixo)) {
-                    await handleComandos(sock, msg, jid, texto, sender);
+                    await handleComandos(sock, msg, jid, texto, sender, metadata);
                     continue;
                 }
 
-                // Ignora admins se configurado
-                if (config.ignorarAdmins) {
-                    const metadata = await sock.groupMetadata(jid);
-                    const isAdmin = ehAdmin(metadata.participants, sender);
-                    if (isAdmin) continue;
-                }
+                if (ehProtegido(sock, sender, metadata.participants)) continue;
 
-                // --- Verificação de conteúdo proibido ---
                 const check = contemConteudoProibido(texto);
                 if (!check.proibido) continue;
 
-                console.log(` [DETECTADO] ${sender} -> "${texto}" | motivo: ${check.motivo}`);
-
-                // 1. Apaga a mensagem
-                try {
-                    await sock.sendMessage(jid, { delete: msg.key });
-                    console.log('  -> Mensagem apagada');
-                } catch (e) {
-                    console.log('  -> Erro ao apagar (bot precisa ser admin):', e.message);
-                    continue;
-                }
-
-                // 2. Sistema de advertências
-                const warnings = carregarWarnings();
-                if (!warnings[jid]) warnings[jid] = {};
-                if (!warnings[jid][sender]) warnings[jid][sender] = 0;
-                warnings[jid][sender] += 1;
-                const atual = warnings[jid][sender];
-                salvarWarnings(warnings);
-
-                // 3. Envia aviso marcando o usuário (igual ao print)
-                let textoAdvertencia = config.mensagemAdvertencia
-                    .replace('{atual}', atual)
-                    .replace('{max}', config.maxAdvertencias);
-
-                // Aviso extra no 2/3
-                if (atual === config.maxAdvertencias - 1) {
-                    textoAdvertencia += `\n\n⚠️ *NA PRÓXIMA VAI LEVAR BAN!*`;
-                }
-
-                // Mensagem no estilo do print: ⛔ @usuario links não permitidos! Advertência 2/3
-                await sock.sendMessage(jid, {
-                    text: `⛔ @${sender.split('@')[0]} ${textoAdvertencia}`,
-                    mentions: [sender]
-                });
-
-                // 4. Aplica punição se atingiu o máximo
-                if (atual >= config.maxAdvertencias) {
-                    if (config.acaoAposMax === 'remover') {
-                        await new Promise(r => setTimeout(r, 1000));
-                        try {
-                            await sock.groupParticipantsUpdate(jid, [sender], 'remove');
-                            await sock.sendMessage(jid, {
-                                text: `🚫 @${sender.split('@')[0]} removido após ${config.maxAdvertencias} advertências.`,
-                                mentions: [sender]
-                            });
-                            console.log(`  -> Usuário ${sender} removido`);
-                        } catch (e) {
-                            console.log('  -> Erro ao remover usuário (bot precisa ser admin):', e.message);
-                        }
-                    }
-                    // Zera após punição
-                    warnings[jid][sender] = 0;
-                    salvarWarnings(warnings);
-                }
-
+                await aplicarAdvertencia(sock, jid, sender, check.motivo, msg.key);
             } catch (err) {
                 console.error('Erro ao processar mensagem:', err);
             }
@@ -302,40 +604,54 @@ async function iniciarBot() {
     });
 }
 
-async function handleComandos(sock, msg, jid, texto, sender) {
+// ====================== COMANDOS ======================
+async function handleComandos(sock, msg, jid, texto, sender, metadata) {
     const args = texto.slice(config.prefixo.length).trim().split(/ +/);
     const comando = args.shift().toLowerCase();
-    const metadata = await sock.groupMetadata(jid);
+    if (!comando) return;
+
     const isAdmin = ehAdmin(metadata.participants, sender);
     const botId = sock.user.id;
-    const botP = metadata.participants.find(p => p.id === botId || p.phoneNumber === botId || p.lid === botId);
-    const isBotAdmin = botP?.admin;
+    const botP = acharParticipante(metadata.participants, botId) || acharParticipante(metadata.participants, sock.user.lid);
+    const isBotAdmin = botP?.admin === 'admin' || botP?.admin === 'superadmin';
 
-    // helper pra responder
-    const reply = (t) => sock.sendMessage(jid, { text: t }, { quoted: msg });
+    const reply = (t, mentions) =>
+        sock.sendMessage(jid, mentions ? { text: t, mentions } : { text: t }, { quoted: msg });
 
     if (comando === 'addpalavra' || comando === 'addword') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const palavra = args.join(' ').toLowerCase();
+        const palavra = normalizar(args.join(' '));
         if (!palavra) return reply(`Uso: ${config.prefixo}addpalavra <palavra>`);
-        if (config.palavrasProibidas.includes(palavra)) return reply('⚠️ Essa palavra já está na lista.');
+        if (config.palavrasProibidas.some(p => normalizar(p) === palavra)) return reply('⚠️ Essa palavra já está na lista.');
         config.palavrasProibidas.push(palavra);
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
-        return reply(`✅ Palavra "${palavra}" adicionada.`);
+        cachePadroes.clear();
+        salvarConfig();
+        return reply(`✅ Palavra "${palavra}" adicionada (palavra inteira).`);
     }
 
     if (comando === 'rmpalavra' || comando === 'removepalavra') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const palavra = args.join(' ').toLowerCase();
-        const idx = config.palavrasProibidas.indexOf(palavra);
+        const palavra = normalizar(args.join(' '));
+        const idx = config.palavrasProibidas.findIndex(p => normalizar(p) === palavra);
         if (idx === -1) return reply('⚠️ Palavra não encontrada.');
         config.palavrasProibidas.splice(idx, 1);
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+        cachePadroes.clear();
+        salvarConfig();
         return reply(`✅ Palavra "${palavra}" removida.`);
     }
 
     if (comando === 'listapalavras' || comando === 'listwords') {
-        return reply(`📋 Palavras proibidas:\n${config.palavrasProibidas.join(', ') || '(nenhuma)'}\n\nAntilink: ${config.antilink ? 'ON' : 'OFF'}`);
+        const lista = config.palavrasProibidas.join(', ') || '(nenhuma)';
+        return reply(`📋 Palavras proibidas:\n${lista}\n\nAntilink: ${config.antilink ? 'ON' : 'OFF'}\nDry-run: ${config.dryRun ? 'ON' : 'OFF'}`);
+    }
+
+    if (comando === 'teste' || comando === 'test') {
+        const amostra = args.join(' ');
+        if (!amostra) return reply(`Uso: ${config.prefixo}teste <texto> — mostra o que o bot detectaria`);
+        const check = contemConteudoProibido(amostra);
+        return reply(check.proibido
+            ? `🚨 SERIA APAGADO — motivo: ${check.motivo}`
+            : `✅ Passaria limpinho, não seria apagado.`);
     }
 
     if (comando === 'antilink') {
@@ -344,42 +660,103 @@ async function handleComandos(sock, msg, jid, texto, sender) {
         if (opt === 'on') config.antilink = true;
         else if (opt === 'off') config.antilink = false;
         else return reply(`Uso: ${config.prefixo}antilink on/off (atual: ${config.antilink ? 'ON' : 'OFF'})`);
-        fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2));
+        salvarConfig();
         return reply(`✅ Antilink: ${config.antilink ? 'ATIVADO' : 'DESATIVADO'}`);
     }
 
+    if (comando === 'dryrun') {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        const opt = args[0]?.toLowerCase();
+        if (opt === 'on') config.dryRun = true;
+        else if (opt === 'off') config.dryRun = false;
+        else return reply(`Uso: ${config.prefixo}dryrun on/off (atual: ${config.dryRun ? 'ON' : 'OFF'})`);
+        salvarConfig();
+        return reply(`🧪 Dry-run: ${config.dryRun ? 'ON (só loga, não apaga)' : 'OFF (apagando normal)'}`);
+    }
+
     if (comando === 'advertencias' || comando === 'warns') {
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const alvoBruto = ctx?.mentionedJid?.[0] || ctx?.participant || sender;
+        const alvo = chaveCanonica(jid, alvoBruto, metadata.participants);
         const warnings = carregarWarnings();
-        const alvo = msg.message?.extendedTextMessage?.contextInfo?.mentionedJid?.[0] || sender;
         const qtd = warnings[jid]?.[alvo] || 0;
-        return reply(`⚠️ @${alvo.split('@')[0]} tem ${qtd}/${config.maxAdvertencias} advertências.`, { mentions: [alvo] });
+        return reply(`⚠️ @${semSufixo(alvo)} tem ${qtd}/${config.maxAdvertencias} advertências.`, [alvo]);
     }
 
     if (comando === 'zerar' || comando === 'resetwarn') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        const ctxZerar = msg.message?.extendedTextMessage?.contextInfo;
-        const alvo = ctxZerar?.mentionedJid?.[0] || ctxZerar?.participant;
-        if (!alvo) return reply(`Uso: ${config.prefixo}zerar @usuario ou responda a mensagem dele com ${config.prefixo}zerar`);
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        const alvoBruto = ctx?.mentionedJid?.[0] || ctx?.participant;
+        if (!alvoBruto) return reply(`Uso: ${config.prefixo}zerar @usuario ou responda a mensagem dele com ${config.prefixo}zerar`);
+        const alvo = chaveCanonica(jid, alvoBruto, metadata.participants);
         const warnings = carregarWarnings();
-        if (warnings[jid]) warnings[jid][alvo] = 0;
+        if (!warnings[jid]) warnings[jid] = {};
+        unificarWarnings(warnings, jid, alvo, aliasesDe(jid, alvo));
+        warnings[jid][alvo] = 0;
         salvarWarnings(warnings);
-        return sock.sendMessage(jid, { text: `✅ Advertências de @${alvo.split('@')[0]} zeradas.`, mentions: [alvo] });
+        return reply(`✅ Advertências de @${semSufixo(alvo)} zeradas.`, [alvo]);
+    }
+
+    if (comando === 'apagar' || comando === 'del' || comando === 'deletar') {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        if (!ctx?.stanzaId) return reply(`↩️ Responda a mensagem que quer apagar com ${config.prefixo}apagar`);
+        const tipo = tipoDaMidia(ctx.quotedMessage) || 'mensagem';
+        const r = await apagarMensagem(sock, jid, chaveCitada(ctx, jid));
+        if (!r.ok) {
+            console.log(` [APAGAR] falhou: ${r.erro}`);
+            return reply('❌ Não consegui apagar. O bot precisa ser admin do grupo.');
+        }
+        return reply(`🗑️ Apagada (${tipo}).`);
+    }
+
+    if (comando === '+18' || comando === 'adulto' || comando === 'nsfw' || comando === 'porn') {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        const ctx = msg.message?.extendedTextMessage?.contextInfo;
+        if (!ctx?.stanzaId) return reply(`↩️ Responda a foto/vídeo com ${config.prefixo}+18`);
+
+        const tipo = tipoDaMidia(ctx.quotedMessage);
+        if (!tipo || !TIPOS_MIDIA.includes(tipo)) {
+            return reply(`Isso não é mídia (é ${tipo || 'desconhecido'}). Usa ${config.prefixo}apagar pra só apagar.`);
+        }
+
+        const autorBruto = ctx.participant;
+        if (!autorBruto) return reply('❌ Não consegui identificar quem mandou a mídia.');
+
+        const alvo = chaveCanonica(jid, autorBruto, metadata.participants);
+        if (alvo === sender) return reply('❌ Essa mídia é sua, não vou me auto-punir.');
+        if (ehProtegido(sock, alvo, metadata.participants)) return reply('❌ Não vou punir admin/dono por isso.');
+
+        const res = await aplicarAdvertencia(sock, jid, alvo, `conteúdo +18 (${tipo})`, chaveCitada(ctx, jid));
+        try { await sock.sendMessage(jid, { delete: msg.key }); } catch { /* opcional */ }
+
+        if (res.dryRun) return reply(`🧪 DRY-RUN: teria apagado a ${tipo} e dado advertência para @${semSufixo(alvo)}.`);
+        if (res.erro) return reply(`❌ Mídia NÃO apagada (${res.erro}) e advertência não contada.`);
+        return;
+    }
+
+    if (comando === 'viewonce') {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        const opt = args[0]?.toLowerCase();
+        if (opt === 'on') config.bloquearViewOnce = true;
+        else if (opt === 'off') config.bloquearViewOnce = false;
+        else return reply(`Uso: ${config.prefixo}viewonce on/off (atual: ${config.bloquearViewOnce ? 'ON' : 'OFF'})`);
+        salvarConfig();
+        return reply(`🕵️ Mídia "ver uma vez": ${config.bloquearViewOnce ? 'BLOQUEADA (apaga + advertência)' : 'liberada'}`);
     }
 
     if (comando === 'ban') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
         const ctx = msg.message?.extendedTextMessage?.contextInfo;
-        const alvo = ctx?.mentionedJid?.[0] || ctx?.participant;
-        if (!alvo) return reply(`Uso: ${config.prefixo}ban @usuario ou responda a mensagem dele com ${config.prefixo}ban`);
+        const alvoBruto = ctx?.mentionedJid?.[0] || ctx?.participant;
+        if (!alvoBruto) return reply(`Uso: ${config.prefixo}ban @usuario ou responda a mensagem dele com ${config.prefixo}ban`);
+        const alvo = chaveCanonica(jid, alvoBruto, metadata.participants);
         if (alvo === sender) return reply('❌ Você não pode se banir kkk');
-        if (alvo === sock.user.id) return reply('❌ Não vou me banir kkk');
+        if (alvo === sock.user.id || alvo === sock.user.lid) return reply('❌ Não vou me banir kkk');
         try {
             await sock.groupParticipantsUpdate(jid, [alvo], 'remove');
-            return sock.sendMessage(jid, {
-                text: `🚫 @${alvo.split('@')[0]} foi banido do grupo.`,
-                mentions: [alvo]
-            });
-        } catch (e) {
+            return reply(`🚫 @${semSufixo(alvo)} foi banido do grupo.`, [alvo]);
+        } catch {
             return reply('❌ Erro ao banir. Verifica se o bot é admin.');
         }
     }
@@ -393,7 +770,7 @@ async function handleComandos(sock, msg, jid, texto, sender) {
             try {
                 await sock.sendMessage(jid, { delete: k });
                 deletadas++;
-            } catch {}
+            } catch { /* já apagada / sem permissão */ }
         }
         mensagensBot[jid] = [];
         return reply(`🗑️ ${deletadas} mensagens apagadas.`);
@@ -438,6 +815,17 @@ async function handleComandos(sock, msg, jid, texto, sender) {
         return reply('🏓 Pong! Bot online.');
     }
 
+    if (comando === 'status') {
+        return reply(
+            `🩺 Status do bot\n` +
+            `Palavras: ${config.palavrasProibidas.length} | Antilink: ${config.antilink ? 'ON' : 'OFF'} | ` +
+            `View-once: ${config.bloquearViewOnce ? 'ON' : 'OFF'}\n` +
+            `Dry-run: ${config.dryRun ? 'ON' : 'OFF'}\n` +
+            `Sou admin aqui: ${isBotAdmin ? 'sim' : 'NÃO'}${isBotAdmin ? '' : ' (não apago nem bano)'}\n` +
+            `Ignorar admins: ${config.ignorarAdmins ? 'ON' : 'OFF'} | Ignorar dono: ${config.ignorarDono ? 'ON' : 'OFF'}`
+        );
+    }
+
     if (comando === 'ajuda' || comando === 'help' || comando === 'menu') {
         const menu =
             `*🤖 ${NOME_BOT_FANCY} - Menu de Comandos* 🤖\n` +
@@ -446,7 +834,12 @@ async function handleComandos(sock, msg, jid, texto, sender) {
             `➕ \`${config.prefixo}addpalavra <palavra>\` - Adiciona palavra proibida\n` +
             `➖ \`${config.prefixo}rmpalavra <palavra>\` - Remove palavra proibida\n` +
             `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
+            `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
             `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +
+            `🕵️ \`${config.prefixo}viewonce on/off\` - Bloqueia mídia "ver uma vez"\n` +
+            `🧪 \`${config.prefixo}dryrun on/off\` - Só loga, não apaga\n` +
+            `🗑️ \`${config.prefixo}apagar\` - Apaga a mensagem respondida\n` +
+            `🔞 \`${config.prefixo}+18\` - Apaga foto/vídeo + advertência\n` +
             `♻️ \`${config.prefixo}zerar @usuario\` - Zera advertências\n` +
             `🚫 \`${config.prefixo}ban\` - Bane (marca ou responde a msg)\n` +
             `🗑️ \`${config.prefixo}limpar\` - Apaga mensagens do bot\n` +
@@ -455,25 +848,26 @@ async function handleComandos(sock, msg, jid, texto, sender) {
             `📡 *GERAL* 📡\n` +
             `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
             `🏓 \`${config.prefixo}ping\` - Testa se o bot está online\n` +
+            `🩺 \`${config.prefixo}status\` - Diagnóstico do bot\n` +
             `❓ \`${config.prefixo}ajuda\` - Mostra este menu`;
 
-        if (isAdmin) {
-            return reply(menu);
-        } else {
-            return reply(
-                `*🤖 ${NOME_BOT_FANCY} - Menu de Comandos* 🤖\n` +
-                `\n` +
-                `👥 *MEMBROS* 👥\n` +
-                `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
-                `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
-                `\n` +
-                `📡 *GERAL* 📡\n` +
-                `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
-                `🏓 \`${config.prefixo}ping\` - Testa se o bot está online\n` +
-                `❓ \`${config.prefixo}ajuda\` - Mostra este menu`
-            );
-        }
+        if (isAdmin) return reply(menu);
+
+        return reply(
+            `*🤖 ${NOME_BOT_FANCY} - Menu de Comandos* 🤖\n` +
+            `\n` +
+            `👥 *MEMBROS* 👥\n` +
+            `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
+            `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
+            `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
+            `\n` +
+            `📡 *GERAL* 📡\n` +
+            `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
+            `🏓 \`${config.prefixo}ping\` - Testa se o bot está online\n` +
+            `🩺 \`${config.prefixo}status\` - Diagnóstico do bot\n` +
+            `❓ \`${config.prefixo}ajuda\` - Mostra este menu`
+        );
     }
 }
 
-iniciarBot();
+iniciarBot().catch(e => console.log('Erro fatal ao iniciar:', e));

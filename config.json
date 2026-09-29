@@ -7,9 +7,6 @@
   "mensagemAdvertencia": "links e mensagens da descrição não são permitidos! ⚠️ Advertência {atual}/{max}",
   "antilink": true,
   "palavrasProibidas": [
-    "palavra1",
-    "palavra2",
-    "exemplo",
     "pix"
   ],
   "linkRegex": [
@@ -21,5 +18,10 @@
     "chat\\.whatsapp\\.com"
   ],
   "gruposPermitidos": [],
-  "ignorarAdmins": true
+  "ignorarAdmins": true,
+  "ignorarDono": true,
+  "donos": [],
+  "dryRun": true,
+  "bloquearViewOnce": false,
+  "cacheMetadataMs": 30000
 }
