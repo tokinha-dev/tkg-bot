@@ -32,7 +32,7 @@
   "cassinoAtivo": true,
   "apostaMinima": 1,
   "saldoInicial": 10,
-  "bonusDiario": 0,
+  "bonusDiario": 2,
   "convidadosNecessarios": 2,
   "fichasPorConvidado": 10
 }

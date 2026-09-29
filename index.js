@@ -8,6 +8,7 @@ const WARNINGS_PATH = './warnings.json';
 const RANK_PATH = './rank.json';
 const CASSINO_PATH = './cassino.json';
 const CONVITES_PATH = './convites.json';
+const BONUS_PATH = './bonus.json';
 const AUTH_FOLDER = './auth_info';
 
 const NOME_BOT_FANCY = '𝐟𝐚𝐦𝐢𝐥𝐢𝐚-𝟏𝟓𝟕-𝐛𝐨𝐭';
@@ -40,6 +41,7 @@ function aplicarPadroes(c) {
     c.apostaMinima ??= 1;
     c.saldoInicial ??= 10;
     c.convidadosNecessarios ??= 2;
+    c.bonusDiario ??= 2;
     c.fichasPorConvidado ??= 10;
     c.cacheMetadataMs ??= 30000;
     return c;
@@ -311,6 +313,38 @@ function ehDono(ref, participants) {
     return cands.some(c => lista.includes(c));
 }
 
+/**
+ * WhatsApp so deixa mandar DM direto pro telefone (@s.whatsapp.net). O id do
+ * participante costuma ser o LID, que nao aceita mensagem privada, entao a
+ * gente resolve o PN e so tenta o PV se realmente achar um.
+ */
+async function telefoneParaDM(sock, ref, participants) {
+    const p = acharParticipante(participants, ref);
+    const cands = [p?.phoneNumber, String(ref || '').includes('@s.whatsapp.net') ? ref : null].filter(Boolean);
+    for (const c of cands) {
+        if (String(c).endsWith('@s.whatsapp.net')) return c;
+    }
+    // Ultimo recurso: LID + API de resolucao do proprio socket
+    const lid = p?.lid || (String(ref || '').endsWith('@lid') ? ref : null);
+    if (lid && typeof sock.signalRepository?.lidMapping?.getPNfromJID === 'function') {
+        try {
+            const pn = await sock.signalRepository.lidMapping.getPNfromJID(lid);
+            if (pn) return `${digitos(pn)}@s.whatsapp.net`;
+        } catch { /* sem resolucao */ }
+    }
+    return null;
+}
+
+/** Link de convite do grupo. Devolve null se o bot nao conseguir (permissao). */
+async function linkDoGrupo(sock, jid) {
+    try {
+        const code = await sock.groupInviteCode(jid);
+        return code ? `https://chat.whatsapp.com/${code}` : null;
+    } catch {
+        return null;
+    }
+}
+
 function ehProtegido(sock, sender, participants) {
     if (!sender) return true;
     const botId = sock.user?.id;
@@ -444,19 +478,72 @@ async function aplicarAdvertencia(sock, jid, alvo, motivo, key) {
 // ====================== CASSINO ======================
 const VERMELHOS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
 
-// Símbolos do tigrinho: [emoji, peso, premio triplo, premio par]
+// Símbolos do tigrinho: [emoji, premio triplo, premio par]
+// O pagamento e' separado dos simbolos: primeiro sorteia o TIPO de resultado
+// (trinca / par / nada) e so depois o simbolo. Com 3 rolos independentes
+// "duas iguais" sai 63% das vezes e qualquer tabela de par paga > 100%, ou
+// seja, o jogador lucra sempre e nunca zera. Sorteando o tipo, o RTP fecha
+// em ~89% (casa ganha ~11%).
 const SIMBOLOS = [
-    { e: '🍒', peso: 30, trio: 5, par: 2 },
-    { e: '🍋', peso: 24, trio: 8, par: 2 },
-    { e: '🍉', peso: 18, trio: 12, par: 2 },
-    { e: '🔔', peso: 14, trio: 20, par: 3 },
-    { e: '⭐', peso: 9, trio: 35, par: 3 },
-    { e: '💎', peso: 5, trio: 80, par: 4 }
+    { e: '🍒', trio: 5, par: 2 },
+    { e: '🍋', trio: 8, par: 2 },
+    { e: '🍉', trio: 12, par: 2 },
+    { e: '🔔', trio: 20, par: 3 },
+    { e: '⭐', trio: 35, par: 3 },
+    { e: '💎', trio: 80, par: 4 }
 ];
+
+// ~2,3% trincas, ~28% par exato, resto nao paga
+const P_TRINCA = 0.023;
+const P_PAR = 0.28;
+// trinca e'力士 rara -> quase sempre cereja/limão. Par e' comum -> barato.
+const PESO_TRINCA = [55, 20, 10, 7, 4, 4];
+const PESO_PAR = [40, 25, 15, 10, 6, 4];
+
+function sortearPonderado(pesos) {
+    const total = pesos.reduce((s, x) => s + x, 0);
+    let n = Math.random() * total;
+    for (let i = 0; i < pesos.length; i++) {
+        n -= pesos[i];
+        if (n <= 0) return SIMBOLOS[i];
+    }
+    return SIMBOLOS[0];
+}
+
+function simboloDiferente(s) {
+    const outros = SIMBOLOS.filter(x => x.e !== s.e);
+    return outros[Math.floor(Math.random() * outros.length)];
+}
+
+function girarTigrinho() {
+    const sorteio = Math.random();
+    if (sorteio < P_TRINCA) {
+        const t = sortearPonderado(PESO_TRINCA);
+        return [t, t, t];
+    }
+    if (sorteio < P_TRINCA + P_PAR) {
+        const p = sortearPonderado(PESO_PAR);
+        const outro = simboloDiferente(p);
+        const rolo = [p, p, outro];
+        // embaralha pra nao sair sempre na mesma posicao
+        for (let i = rolo.length - 1; i > 0; i--) {
+            const j = Math.floor(Math.random() * (i + 1));
+            [rolo[i], rolo[j]] = [rolo[j], rolo[i]];
+        }
+        return rolo;
+    }
+    // sem premio: tres simbolos distintos
+    const r = [];
+    while (r.length < 3) {
+        const s = SIMBOLOS[Math.floor(Math.random() * SIMBOLOS.length)];
+        if (!r.some(x => x.e === s.e)) r.push(s);
+    }
+    return r;
+}
 
 function saldoDe(dados, jid, user) {
     if (!dados[jid]) dados[jid] = {};
-    if (dados[jid][user] === undefined) dados[jid][user] = config.saldoInicial ?? 100;
+    if (dados[jid][user] === undefined) dados[jid][user] = config.saldoInicial ?? 10;
     return dados[jid][user];
 }
 
@@ -486,19 +573,142 @@ function marcarConvidado(reg, jid, user, porQuem) {
     reg[jid + '|' + user] = { por: porQuem, em: Date.now() };
 }
 
-function girarTigrinho() {
-    const total = SIMBOLOS.reduce((s, x) => s + x.peso, 0);
-    const rolo = [];
-    for (let i = 0; i < 3; i++) {
-        let n = Math.random() * total;
-        let escolhido = SIMBOLOS[0];
-        for (const s of SIMBOLOS) {
-            n -= s.peso;
-            if (n <= 0) { escolhido = s; break; }
-        }
-        rolo.push(escolhido);
+// ====================== BLACKJACK ======================
+const NAIPES = ['♠️', '♥️', '♦️', '♣️'];
+const VALORES = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+let BARALHO = [];
+
+function novoBaralho() {
+    const b = [];
+    for (const naipe of NAIPES)
+        for (const valor of VALORES)
+            b.push({ naipe, valor });
+    for (let i = b.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [b[i], b[j]] = [b[j], b[i]];
     }
-    return rolo;
+    return b;
+}
+
+function embaralharBaralho() {
+    BARALHO = novoBaralho();
+    return BARALHO;
+}
+
+// 21 = blackjack natural. 2 cartas somando 21.
+function blackjackNatural(cartas) {
+    return cartas.length === 2 && valorDaMao(cartas) === 21;
+}
+
+function valorDaCarta(c) {
+    if (c.valor === 'A') return 11;
+    if (['J', 'Q', 'K'].includes(c.valor)) return 10;
+    return parseInt(c.valor, 10);
+}
+
+function valorDaMao(cartas) {
+    let total = 0, ases = 0;
+    for (const c of cartas) {
+        total += valorDaCarta(c);
+        if (c.valor === 'A') ases++;
+    }
+    // Ás vale 11, mas se estourar troca pra 1 até caber
+    while (total > 21 && ases > 0) {
+        total -= 10;
+        ases--;
+    }
+    return total;
+}
+
+function cartaTexto(c) {
+    return `${c.naipe}${c.valor}`;
+}
+
+function maoTexto(cartas) {
+    return cartas.map(cartaTexto).join(' ');
+}
+
+const jogosBJ = new Map();
+
+function chaveJogo(jid, user) {
+    return jid + '|' + user;
+}
+
+function comprarCarta() {
+    if (BARALHO.length === 0) embaralharBaralho();
+    return BARALHO.pop();
+}
+
+function iniciarBlackjack(jid, user, aposta) {
+    embaralharBaralho();
+    const jogo = {
+        aposta,
+        jogador: [comprarCarta(), comprarCarta()],
+        mesa: [comprarCarta(), comprarCarta()],
+        turno: 'jogador',
+        finished: false
+    };
+    jogosBJ.set(chaveJogo(jid, user), jogo);
+    return jogo;
+}
+
+function textoCartaoMesa(jogo, revelar) {
+    return revelar ? maoTexto(jogo.mesa) : `${cartaTexto(jogo.mesa[0])} 🂠`;
+}
+
+function textoBlackjack(jid, user, jogo, saldo, revealMesa) {
+    const jv = valorDaMao(jogo.jogador);
+    const mv = revealMesa ? valorDaMao(jogo.mesa) : null;
+    let out = `🃏 *BLACKJACK*\n\n` +
+        `🃏 Você: ${maoTexto(jogo.jogador)} = *${jv}*\n` +
+        `🎴 Mesa: ${textoCartaoMesa(jogo, revealMesa)}`;
+    if (mv !== null) out += ` = *${mv}*`;
+    out += `\n\n💰 Saldo: *${saldo.toLocaleString('pt-BR')}*`;
+    return out;
+}
+
+function finalizarBlackjack(jid, user, jogo, dados) {
+    // resultado: 'venceu' | 'perdeu' | 'empate' | 'estourou' | 'blackjack'
+    const jv = valorDaMao(jogo.jogador);
+    const mv = valorDaMao(jogo.mesa);
+    let titulo, retorno;
+
+    if (resultadoDe(jv, mv, jogo) === 'estourou') {
+        titulo = '💥 *ESTOUROU!* Você passou de 21.';
+        retorno = 0;
+    } else if (resultadoDe(jv, mv, jogo) === 'blackjack') {
+        titulo = '🎉 *BLACKJACK!!!* 21 com 2 cartas.';
+        retorno = Math.floor(jogo.aposta * 2.5);
+    } else if (resultadoDe(jv, mv, jogo) === 'venceu') {
+        titulo = '🎉 *GANHOU!* Você fez mais que a mesa.';
+        retorno = jogo.aposta * 2;
+    } else if (resultadoDe(jv, mv, jogo) === 'empate') {
+        titulo = '🤝 *EMPATE!* Mesmo valor.';
+        retorno = jogo.aposta;
+    } else {
+        titulo = '💀 *PERDEU.* A mesa fez mais.';
+        retorno = 0;
+    }
+
+    const saldo = definirSaldo(dados, jid, user, saldoDe(dados, jid, user) + retorno);
+    const lucro = retorno - jogo.aposta;
+
+    let out = textoBlackjack(jid, user, jogo, saldo, true) + '\n\n' + titulo;
+    if (lucro > 0) out += `\n💵 *+${lucro.toLocaleString('pt-BR')}* de lucro!`;
+    else if (resultadoDe(jv, mv, jogo) === 'empate') out += `\n_(aposta devolvida)_`;
+    return { texto: out, saldo, lucro };
+}
+
+function resultadoDe(jv, mv, jogo) {
+    if (jv > 21) return 'estourou';
+    if (blackjackNatural(jogo.jogador)) return 'blackjack';
+    // A mesa estourar e' VITORIA do jogador. Precisa vir antes da comparacao,
+    // senao 20 vs 25 cai em "perdeu" e a casa ganha ate quando quebra.
+    if (mv > 21) return 'venceu';
+    if (blackjackNatural(jogo.mesa)) return 'perdeu';
+    if (jv > mv) return 'venceu';
+    if (jv === mv) return 'empate';
+    return 'perdeu';
 }
 
 // ====================== ANTI-DUPLICIDADE ======================
@@ -950,17 +1160,31 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         if (s <= 0) return reply(avisoSemSaldo(s), [sender]);
         return reply(
             `💰 @${semSufixo(sender)} você tem *${s.toLocaleString('pt-BR')}* fichas.\n\n` +
-            `🎰 Roleta: \`${config.prefixo}roleta 1 vermelho\`\n` +
-            `🐯 Tigrinho: \`${config.prefixo}tigrinho 1\``,
+            `🃏 21: \`${config.prefixo}blackjack 1\`\n` +
+            `🐯 Tigre: \`${config.prefixo}tigre 1\`\n` +
+            `🎰 Roleta: \`${config.prefixo}roleta 1 vermelho\``,
             [sender]
         );
     }
 
-    if (['bonus', 'bônus', 'daily'].includes(comando)) {
+    if (['bonus', 'bônus', 'bomus', 'daily'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const dia = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const bonus = carregarJson(BONUS_PATH);
+        if (!bonus[jid]) bonus[jid] = {};
+        if (bonus[jid][sender] === dia) {
+            return reply(`⏳ @${semSufixo(sender)} você já pegou o bônus de hoje. Volta amanhã!`, [sender]);
+        }
+        bonus[jid][sender] = dia;
+        fs.writeFileSync(BONUS_PATH, JSON.stringify(bonus, null, 2));
+
+        const dados = carregarJson(CASSINO_PATH);
+        const ganho = config.bonusDiario ?? 2;
+        const novo = definirSaldo(dados, jid, sender, saldoDe(dados, jid, sender) + ganho);
+        fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+
         return reply(
-            `🚫 *Não tem bônus diário.*\n\n` +
-            `As fichas só voltam recruitedando gente:\n` +
-            `\`${config.prefixo}convidar @pessoa1 @pessoa2\``,
+            `🎁 @${semSufixo(sender)} pegou *+${ganho}* ficha${ganho > 1 ? 's' : ''} de bônus diário!\n💰 Saldo: *${novo.toLocaleString('pt-BR')}*`,
             [sender]
         );
     }
@@ -1022,11 +1246,115 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         );
     }
 
-    if (['tigrinho', 'tigre', 'slot', 'caça', 'caca'].includes(comando)) {
+    if (['blackjack', 'bj', 'black', 'jogo21', '21'].includes(comando)) {
+        if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
+        const acao = (args[0] || '').toLowerCase();
+        const chave = chaveJogo(jid, sender);
+        const jogo = jogosBJ.get(chave);
+
+        // Continuação de uma partida em andamento
+        if (acao === 'hit' || acao === 'pedir' || acao === 'puxar' || acao === 'h') {
+            if (!jogo || jogo.finished) return reply('❌ Você não tem jogo em andamento. Use `' + config.prefixo + 'blackjack <aposta>`.');
+            const dados = carregarJson(CASSINO_PATH);
+            const v = valorDaMao(jogo.jogador);
+            if (v === 21) return reply('🃏 Você já fez 21! Use `' + config.prefixo + 'bj stand` para a mesa jogar.');
+            jogo.jogador.push(comprarCarta());
+            const novoValor = valorDaMao(jogo.jogador);
+            if (novoValor > 21) {
+                jogo.finished = true;
+                jogosBJ.delete(chave);
+                const r = finalizarBlackjack(jid, sender, jogo, dados);
+                fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+                return reply(r.texto, [sender]);
+            }
+            if (novoValor === 21) {
+                while (valorDaMao(jogo.mesa) < 17) jogo.mesa.push(comprarCarta());
+                jogo.turno = 'mesa';
+                jogo.finished = true;
+                jogosBJ.delete(chave);
+                const r = finalizarBlackjack(jid, sender, jogo, dados);
+                fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+                return reply(r.texto, [sender]);
+            }
+            definirSaldo(dados, jid, sender, saldoDe(dados, jid, sender));
+            fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+            const saldo = saldoDe(dados, jid, sender);
+            return reply(
+                textoBlackjack(jid, sender, jogo, saldo, false) +
+                `\n\n➡️ Use \`${config.prefixo}bj hit\` ou \`${config.prefixo}bj stand\``,
+                [sender]
+            );
+        }
+
+        if (acao === 'stand' || acao === 'parar' || acao === 's') {
+            if (!jogo || jogo.finished) return reply('❌ Você não tem jogo em andamento. Use `' + config.prefixo + 'blackjack <aposta>`.');
+            const dados = carregarJson(CASSINO_PATH);
+            // A mesa compra até 17 ou mais
+            while (valorDaMao(jogo.mesa) < 17) jogo.mesa.push(comprarCarta());
+            jogo.finished = true;
+            jogosBJ.delete(chave);
+            const r = finalizarBlackjack(jid, sender, jogo, dados);
+            fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+            return reply(r.texto, [sender]);
+        }
+
+        if (acao === 'desistir' || acao === 'sair' || acao === 'd') {
+            if (!jogo || jogo.finished) return reply('❌ Você não tem jogo em andamento.');
+            const dados = carregarJson(CASSINO_PATH);
+            jogo.finished = true;
+            jogosBJ.delete(chave);
+            // Desistir devolve metade
+            const metade = Math.floor(jogo.aposta / 2);
+            const s = definirSaldo(dados, jid, sender, saldoDe(dados, jid, sender) + metade);
+            fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+            return reply(
+                `🃏 Você desistiu.\n\n` +
+                `🎴 Mesa: ${textoCartaoMesa(jogo, true)} = *${valorDaMao(jogo.mesa)}*\n` +
+                `Recuperou metade da aposta: *+${metade}*\n` +
+                `💰 Saldo: *${s.toLocaleString('pt-BR')}*`,
+                [sender]
+            );
+        }
+
+        // Início de partida
+        const valor = parseInt(args[0]);
+        if (!valor || valor < config.apostaMinima) {
+            return reply(
+                `Uso: \`${config.prefixo}blackjack <aposta>\`\n` +
+                `Mínimo: ${config.apostaMinima} ficha(s)\n\n` +
+                `🃏 21 com 2 cartas paga 2.5x | beating mesa paga 2x | empate devolve`
+            );
+        }
+        const dados = carregarJson(CASSINO_PATH);
+        const saldo = saldoDe(dados, jid, sender);
+        if (saldo < valor) return reply(avisoSemSaldo(saldo) + `\n\n_(aposta pedida: ${valor.toLocaleString('pt-BR')})_`);
+        if (jogo && !jogo.finished) return reply('⚠️ Você já tem um jogo em andamento! Use `' + config.prefixo + 'bj stand`.`');
+
+        definirSaldo(dados, jid, sender, saldo - valor);
+        fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+
+        const novoJogo = iniciarBlackjack(jid, sender, valor);
+
+        if (blackjackNatural(novoJogo.jogador)) {
+            novoJogo.finished = true;
+            jogosBJ.delete(chaveJogo(jid, sender));
+            const r = finalizarBlackjack(jid, sender, novoJogo, dados);
+            fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+            return reply(r.texto, [sender]);
+        }
+
+        return reply(
+            textoBlackjack(jid, sender, novoJogo, saldoDe(dados, jid, sender), false) +
+            `\n\n➡️ Use \`${config.prefixo}bj hit\` ou \`${config.prefixo}bj stand\``,
+            [sender]
+        );
+    }
+
+    if (['tigre', 'tigrinho', 'slot', 'tcaça', 'tca'].includes(comando)) {
         if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
         const valor = parseInt(args[0]);
         if (!valor || valor < config.apostaMinima) {
-            return reply(`Uso: ${config.prefixo}tigrinho <aposta>\nMínimo: ${config.apostaMinima} fichas`);
+            return reply(`Uso: ${config.prefixo}tigre <aposta>\nMínimo: ${config.apostaMinima} ficha(s)`);
         }
         const dados = carregarJson(CASSINO_PATH);
         const saldo = saldoDe(dados, jid, sender);
@@ -1061,6 +1389,41 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         }
 
         fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
+
+        // === Giro com parada de carta ===
+        // A carta vai parando uma a uma e o multiplicador sobe junto, como
+        // caça-níquel de verdade. Começa em 5x (o trio mais barato) e só
+        // engata se as cartas baterem entre si.
+        const MIN_X = Math.min(...SIMBOLOS.map(s => s.trio));
+        const mostrar = (parcial, mult) =>
+            `🐯 *TIGRINHO*\n\n` +
+            `\`${[0, 1, 2].map(i => parcial[i]?.e || '🎴').join(' │ ')}\`\n` +
+            `🎁 Multiplicador: *${mult}x*`;
+
+        const dormir = ms => new Promise(r => setTimeout(r, ms));
+
+        await sock.sendMessage(jid, { text: mostrar([null, null, null], MIN_X) });
+        for (let i = 0; i < 3; i++) {
+            await dormir(1100);
+            const parcial = rolo.slice(0, i + 1);
+            const restantes = 3 - parcial.length;
+            let mult;
+            if (restantes === 0) {
+                // última carta: multiplicador definitivo
+                if (a.e === b.e && b.e === c.e) mult = a.trio;
+                else if (a.e === b.e || b.e === c.e || a.e === c.e) {
+                    const p = a.e === b.e ? a : b.e === c.e ? b : a;
+                    mult = p.par;
+                } else mult = 0;
+            } else if (restantes === 1) {
+                // duas cartas iguais: jackpot em jogo (o trio daquele símbolo)
+                mult = parcial[0].e === parcial[1].e ? parcial[0].trio : MIN_X;
+            } else {
+                // uma carta: mostra o trio dela, o prêmio que tá em disputa
+                mult = parcial[0].trio;
+            }
+            await sock.sendMessage(jid, { text: mostrar(parcial, mult) });
+        }
 
         const primeiro = novoRecorde;
         return reply(
@@ -1130,6 +1493,32 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             out += `\n\n_ignorados: ${invalidos.map(x => `\`${x}\``).join(', ')}_\n` +
                 `_(só valem ${precisa} por comando)_`;
         }
+
+        // Manda o link do grupo no PV de quem recruitou: ai ele repassa pra
+        // quem convidou. Sem o link a pessoa nao tem como trazer ninguem.
+        const link = await linkDoGrupo(sock, jid);
+        if (link) {
+            const dm = await telefoneParaDM(sock, sender, metadata.participants);
+            if (dm) {
+                try {
+                    await sock.sendMessage(dm, {
+                        text:
+                            `🎁 *Você ganhou ${ganho} fichas!*\n\n` +
+                            `Repasse esse link para as pessoas que você chamou:\n` +
+                            `${link}\n\n` +
+                            `_(cada pessoa nova vale ${porConv} fichas, e só conta uma vez)_`
+                    });
+                    out += `\n\n📬 *Te mandei o link do grupo no PV!*`;
+                } catch {
+                    out += `\n\n⚠️ *Não consegui mandar no seu PV.* Use este link:\n${link}`;
+                }
+            } else {
+                out += `\n\n📢 *Link do grupo para repassar:*\n${link}`;
+            }
+        } else {
+            out += `\n\n⚠️ *Não consegui pegar o link do grupo.* Me pede como admin que eu libero.`;
+        }
+
         return reply(out, [sender, ...validos]);
     }
 
@@ -1138,7 +1527,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const dados = carregarJson(CASSINO_PATH);
         const lista = (dados.records?.[jid]?.tigrinho || []).slice(0, 10);
         if (!lista.length) {
-            return reply(`🐯 *NINGUÉM BATEU RECORDE AINHOUR*\n\nJogue ${config.prefixo}tigrinho ${config.apostaMinima} e apareça aqui! 🥇`);
+            return reply(`🐯 *NINGUÉM BATEU RECORDE AINHOUR*\n\nJogue ${config.prefixo}tigre ${config.apostaMinima} e apareça aqui! 🥇`);
         }
         const medalhas = ['🥇', '🥈', '🥉'];
         let out = `🐯 *MAIORES GANHOS NO TIGRINHO* 🐯\n\n` +
@@ -1156,7 +1545,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const lista = Object.entries(dados[jid] || {})
             .sort((a, b) => b[1] - a[1])
             .slice(0, 10);
-        if (!lista.length) return reply('🎰 Ninguém jogou ainda. Começa com `!roleta 10 vermelho`!');
+        if (!lista.length) return reply('🎰 Ninguém jogou ainda. Começa com `!roleta 1 vermelho`!');
         const medalhas = ['🥇', '🥈', '🥉'];
         let out = '🏆 *RANKING DO CASSINO*\n\n';
         lista.forEach(([u, v], i) => {
@@ -1223,9 +1612,11 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `\n` +
             `🎰 *CASSINO* 🎰\n` +
             `💰 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
+            `🎁 \`${config.prefixo}bonus\` - Bônus diário (+2)\n` +
             `🎁 \`${config.prefixo}convidar @a @b\` - Traga 2 novos (+10 cada)\n` +
             `🎡 \`${config.prefixo}roleta <aposta> <aposta>\` - Roleta russa\n` +
-            `🐯 \`${config.prefixo}tigrinho <aposta>\` - Caça-níquel\n` +
+            `🐯 \`${config.prefixo}tigre <aposta>\` - Caça-níquel\n` +
+            `🃏 \`${config.prefixo}blackjack <aposta>\` - 21 contra a mesa\n` +
             `🏆 \`${config.prefixo}recordes\` - Maiores premios do tigrinho\n` +
             `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
             `🎁 \`${config.prefixo}dar @usuario <valor>\` - Dá fichas (ADMs)\n` +
@@ -1248,9 +1639,11 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `\n` +
             `🎰 *CASSINO* 🎰\n` +
             `💰 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
+            `🎁 \`${config.prefixo}bonus\` - Bônus diário (+2)\n` +
             `🎁 \`${config.prefixo}convidar @a @b\` - Traga 2 novos (+10 cada)\n` +
             `🎡 \`${config.prefixo}roleta <aposta> <aposta>\` - Roleta russa\n` +
-            `🐯 \`${config.prefixo}tigrinho <aposta>\` - Caça-níquel\n` +
+            `🐯 \`${config.prefixo}tigre <aposta>\` - Caça-níquel\n` +
+            `🃏 \`${config.prefixo}blackjack <aposta>\` - 21 contra a mesa\n` +
             `🏆 \`${config.prefixo}recordes\` - Maiores premios do tigrinho\n` +
             `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
             `\n` +
