@@ -4,5 +4,8 @@ auth_info_backup/
 auth_b64.txt
 warnings.json
 rank.json
+cassino.json
+bonus.json
+convites.json
 *.log
 .env

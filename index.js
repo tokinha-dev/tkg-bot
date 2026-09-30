@@ -388,6 +388,27 @@ async function apagarMensagem(sock, jid, key) {
     }
 }
 
+/** Texto de qualquer tipo de mensagem, inclusive view-once e efêmera. */
+function getTextoMensagem(msg) {
+    const m = msg.message;
+    if (!m) return '';
+    if (m.ephemeralMessage?.message) return getTextoMensagem({ message: m.ephemeralMessage.message });
+    if (m.viewOnceMessage?.message) return getTextoMensagem({ message: m.viewOnceMessage.message });
+    if (m.viewOnceMessageV2?.message) return getTextoMensagem({ message: m.viewOnceMessageV2.message.message || m.viewOnceMessageV2.message });
+    if (m.viewOnceMessageV2Extension?.message) return getTextoMensagem({ message: m.viewOnceMessageV2Extension.message });
+    if (m.buttonsMessage?.contentText) return m.buttonsMessage.contentText;
+    if (m.templateMessage?.hydratedTemplate?.hydratedContentText) return m.templateMessage.hydratedTemplate.hydratedContentText;
+    if (m.listMessage?.description) return m.listMessage.description;
+    if (m.pollCreationMessage?.name) return m.pollCreationMessage.name;
+    return (
+        m.conversation ||
+        m.extendedTextMessage?.text ||
+        m.imageMessage?.caption ||
+        m.videoMessage?.caption ||
+        ''
+    );
+}
+
 /** Reconhece o tipo de mídia, desembrulhando view-once/efêmera. */
 function tipoDaMidia(m) {
     if (!m) return null;
