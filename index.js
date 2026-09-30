@@ -478,6 +478,56 @@ async function aplicarAdvertencia(sock, jid, alvo, motivo, key) {
 // ====================== CASSINO ======================
 const VERMELHOS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
 
+// Ordem real da roda da roleta europeia. O zero fica no centro da mandala e
+// os 36 restantes giram em volta nessa ordem, entao a roda "conta" igual a de
+// verdade quando a bola vai parando.
+const ORDEM_ROLETA = [
+    32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10,
+    5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
+];
+
+// Desenha a mandala da roleta numa grade de texto. Cada numero vira um emoji
+// colorido + o numero, com o 0 (branco) no centro. `bola` troca o coracao do
+// numero sorteado pela bola vermelha, que e o efeito de "a bola parou aqui".
+function desenharMandala(bola) {
+    const L = 59, A = 29, cx = 29, cy = 14, rx = 26.5, ry = 13;
+    const grade = Array.from({ length: A }, () => new Array(L).fill(' '));
+    const livre = (l, c) => l >= 0 && l < A && c >= 0 && c < L && grade[l][c] === ' ';
+
+    // Escreve centralizando o texto; se bater em outro numero, tenta a linha
+    // vizinha ate achar espaço (mantem a roda legível mesmo se as bordas
+    // ficarem apertadas no topo, onde o circulo achata).
+    function poe(linha, coluna, txt) {
+        for (const d of [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5]) {
+            const l = linha + d;
+            const x0 = coluna - Math.floor(txt.length / 2);
+            let cabe = true;
+            for (let k = 0; k < txt.length; k++) {
+                if (!livre(l, x0 + k)) { cabe = false; break; }
+            }
+            if (cabe) {
+                for (let k = 0; k < txt.length; k++) grade[l][x0 + k] = txt[k];
+                return;
+            }
+        }
+    }
+
+    const anguloDe = {};
+    ORDEM_ROLETA.forEach((num, k) => {
+        const ang = (k * 2 * Math.PI) / ORDEM_ROLETA.length - Math.PI / 2;
+        anguloDe[num] = ang;
+        const txt = num === bola
+            ? '\u{1F534}' + num
+            : VERMELHOS.has(num) ? '\u2764' + num : '\u{1F5A4}' + num;
+        poe(Math.round(cy + ry * Math.sin(ang)), Math.round(cx + rx * Math.cos(ang)), txt);
+    });
+    // o 0 fica sempre visivel no miolo; so vira bola vermelha quando foi ele
+    // que saiu. Durante o giro o centro continua branco, senao o 0 sumiria.
+    poe(cy, cx, bola === 0 ? '\u{1F534}0' : '\u{1F90D}0');
+
+    return grade.map(l => l.join('').replace(/\s+$/, '')).join('\n');
+}
+
 // Símbolos do tigrinho: [emoji, premio triplo, premio par]
 // O pagamento e' separado dos simbolos: primeiro sorteia o TIPO de resultado
 // (trinca / par / nada) e so depois o simbolo. Com 3 rolos independentes
@@ -553,24 +603,11 @@ function definirSaldo(dados, jid, user, valor) {
     return dados[jid][user];
 }
 
-// Zera a carteira -> precisa recrutar. Usado como resposta de "saldo insuficiente".
+// Zera a carteira. Usado como resposta de "saldo insuficiente".
 function avisoSemSaldo(saldo) {
-    const precisa = config.convidadosNecessarios ?? 2;
     return `💸 *Você ficou sem fichas!*\n\n` +
-        `Saldo atual: *${(saldo || 0).toLocaleString('pt-BR')}*\n` +
-        `🎁 Chame *${precisa} pessoas novas* pro grupo e ganhe *${(config.fichasPorConvidado ?? 10) * precisa} fichas*!\n\n` +
-        `Como chamar: marque as ${precisa} pessoas numa mensagem e envie\n` +
-        `\`${config.prefixo}convidar @pessoa1 @pessoa2\``;
-}
-
-// Quem já foi "convidado" por alguém. Chave global (jid + pessoa) pra mesma
-// pessoa nunca valer como novata duas vezes, nem em grupos diferentes.
-function foiConvidado(reg, jid, user) {
-    return !!reg[jid + '|' + user];
-}
-
-function marcarConvidado(reg, jid, user, porQuem) {
-    reg[jid + '|' + user] = { por: porQuem, em: Date.now() };
+        `Saldo atual: *${(saldo || 0).toLocaleString('pt-BR')}*\n\n` +
+        `🎁 Espere o bônus diário com \`${config.prefixo}bonus\` ou peça fichas a um ADM.`;
 }
 
 // ====================== BLACKJACK ======================
@@ -656,7 +693,12 @@ function textoCartaoMesa(jogo, revelar) {
     return revelar ? maoTexto(jogo.mesa) : `${cartaTexto(jogo.mesa[0])} 🂠`;
 }
 
-function textoBlackjack(jid, user, jogo, saldo, revealMesa) {
+// Dica unica de turno, pra nao repetir texto em 5 lugares diferentes.
+function dicaBlackjack() {
+    return `\n\n*Pedir mais: \`${config.prefixo}bj 1\`*  •  *Parar: \`${config.prefixo}bj -1\`*`;
+}
+
+function textoBlackjack(jid, user, jogo, saldo, revelarMesa) {
     const jv = valorDaMao(jogo.jogador);
     const mv = revealMesa ? valorDaMao(jogo.mesa) : null;
     let out = `🃏 *BLACKJACK*\n\n` +
@@ -1194,7 +1236,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const valor = parseInt(args[0]);
         const escolha = (args[1] || '').toLowerCase();
         if (!valor || valor < config.apostaMinima) {
-            return reply(`Uso: ${config.prefixo}roleta <aposta> <vermelho|preto|par|impar|baixo|alto|N 1-36>`);
+            return reply(`Uso: ${config.prefixo}roleta <aposta> <vermelho|preto|par|impar|baixo|alto|N 0-36>`);
         }
         const dados = carregarJson(CASSINO_PATH);
         const saldo = saldoDe(dados, jid, sender);
@@ -1222,8 +1264,13 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             ganhou = numero >= 19 && numero <= 36; premio = valor * 2; descricao = '19 a 36';
         } else if (/^\d{1,2}$/.test(escolha)) {
             const alvo = parseInt(escolha);
-            ganhou = numero === alvo; premio = valor * 36;
-            descricao = `número ${alvo}`;
+            if (alvo < 0 || alvo > 36) {
+                return reply(`❌ Número inválido. Use de *0 a 36* _(o 0 é a casa verde e nunca paga)_.`);
+            }
+            // o 0 nao esta na roda: e' a casa verde e sempre perde
+            ganhou = numero === alvo && alvo !== 0;
+            premio = valor * 36;
+            descricao = alvo === 0 ? 'número 0 (nunca paga)' : `número ${alvo}`;
         } else {
             return reply('❌ Aposta inválida. Use: vermelho, preto, par, impar, baixo, alto ou um número de 0 a 36.');
         }
@@ -1234,11 +1281,68 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
 
         const bola = cor === 'verde' ? '🟢' : cor === 'vermelho' ? '🔴' : '⚫';
+        // Caiu no 0: a casa leva. Vale tanto pra cor (o 0 nao e' vermelho nem
+        // preto) quanto pra numero, porque ninguem ganha no verde.
+        const saiuZero = numero === 0;
         const cab = ganhou
             ? `🎉 *GANHOU!* +${premio.toLocaleString('pt-BR')} fichas`
-            : `💀 Perdeu ${valor.toLocaleString('pt-BR')} fichas`;
+            : saiuZero
+                ? `🏠 *CASA VERDE!* Você perdeu ${valor.toLocaleString('pt-BR')} fichas`
+                : `💀 Perdeu ${valor.toLocaleString('pt-BR')} fichas`;
+
+        // === A bola gira antes de revelar ===
+        // Anda pela roda na ordem real e desacelera, como a roleta de cassino.
+        // A desaceleração e' montada ANTES: a soma dos passos diz quantas
+        // casas a bola percorre e a bola comeca essa distancia do alvo, pra
+        // usar todos os quadros e ainda pousar certeiro. Sem isso o ultimo
+        // passo teria de ser cortado e um passo par nunca alcança casa ímpar.
+        const dormir = ms => new Promise(r => setTimeout(r, ms));
+        const nCasas = ORDEM_ROLETA.length;
+        const posDoNumero = new Map(ORDEM_ROLETA.map((n, i) => [n, i]));
+        const alvo = posDoNumero.get(numero);
+
+        if (alvo != null || saiuZero) {
+            // No 0 a bola cai no miolo: ela ainda gira pelo aro e so o ultimo
+            // quadro acende o 0 no centro, como se tivesse entrado no bolso.
+            const destino = alvo != null ? alvo : Math.floor(Math.random() * nCasas);
+            const nPassos = 9 + Math.floor(Math.random() * 4);
+            const passos = [];
+            let passo = 11, soma = 0;
+            for (let i = 0; i < nPassos; i++) {
+                passos.push(passo);
+                soma += passo;
+                passo = Math.max(1, Math.floor(passo * 0.82));
+            }
+            // meia volta extra no comeco, pra dois giros nao ficarem iguais
+            if (Math.random() < 0.5) { passos.unshift(nCasas - 1); soma += nCasas - 1; }
+
+            let casa = (destino - soma) % nCasas;
+            if (casa < 0) casa += nCasas;
+            const trilha = [];
+            for (const p of passos) {
+                casa = (casa + p) % nCasas;
+                trilha.push(casa);
+            }
+            if (trilha[trilha.length - 1] !== destino) trilha.push(destino);
+
+            for (let i = 0; i < trilha.length; i++) {
+                const falta = trilha.length - i;
+                await dormir(falta > 4 ? 130 : 320);
+                // o ultimo quadro mostra sempre o numero real sorteado
+                const bolaDoQuadro = i === trilha.length - 1 ? numero : ORDEM_ROLETA[trilha[i]];
+                try {
+                    await sock.sendMessage(jid, {
+                        text:
+                            `\`${desenharMandala(bolaDoQuadro)}\`\n\n` +
+                            `🎰 A bola está girando…`
+                    });
+                } catch { /* grupo sem permissao pra enviar: segue sem a animacao */ }
+            }
+        }
+
         return reply(
             `🎰 *ROLETA* ${bola} ${numero} ${cor.toUpperCase()}\n\n` +
+            `\`${desenharMandala(numero)}\`\n` +
             `🎯 Aposta: ${descricao} • ${valor.toLocaleString('pt-BR')}\n` +
             `${cab}\n` +
             `💰 Saldo: *${saldoFinal.toLocaleString('pt-BR')}*`,
@@ -1253,11 +1357,11 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const jogo = jogosBJ.get(chave);
 
         // Continuação de uma partida em andamento
-        if (acao === 'hit' || acao === 'pedir' || acao === 'puxar' || acao === 'h') {
+        if (acao === 'hit' || acao === 'pedir' || acao === 'puxar' || acao === 'h' || acao === '1' || acao === '+1' || acao === 'mais') {
             if (!jogo || jogo.finished) return reply('❌ Você não tem jogo em andamento. Use `' + config.prefixo + 'blackjack <aposta>`.');
             const dados = carregarJson(CASSINO_PATH);
             const v = valorDaMao(jogo.jogador);
-            if (v === 21) return reply('🃏 Você já fez 21! Use `' + config.prefixo + 'bj stand` para a mesa jogar.');
+            if (v === 21) return reply('🃏 Você já fez 21! Use `' + config.prefixo + 'bj -1` para a mesa jogar.');
             jogo.jogador.push(comprarCarta());
             const novoValor = valorDaMao(jogo.jogador);
             if (novoValor > 21) {
@@ -1280,13 +1384,12 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
             const saldo = saldoDe(dados, jid, sender);
             return reply(
-                textoBlackjack(jid, sender, jogo, saldo, false) +
-                `\n\n➡️ Use \`${config.prefixo}bj hit\` ou \`${config.prefixo}bj stand\``,
+                textoBlackjack(jid, sender, jogo, saldo, false) + dicaBlackjack(),
                 [sender]
             );
         }
 
-        if (acao === 'stand' || acao === 'parar' || acao === 's') {
+        if (acao === 'stand' || acao === 'parar' || acao === 's' || acao === '-1' || acao === 'menos') {
             if (!jogo || jogo.finished) return reply('❌ Você não tem jogo em andamento. Use `' + config.prefixo + 'blackjack <aposta>`.');
             const dados = carregarJson(CASSINO_PATH);
             // A mesa compra até 17 ou mais
@@ -1298,7 +1401,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             return reply(r.texto, [sender]);
         }
 
-        if (acao === 'desistir' || acao === 'sair' || acao === 'd') {
+        if (acao === 'desistir' || acao === 'sair' || acao === 'd' || acao === '0') {
             if (!jogo || jogo.finished) return reply('❌ Você não tem jogo em andamento.');
             const dados = carregarJson(CASSINO_PATH);
             jogo.finished = true;
@@ -1328,7 +1431,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const dados = carregarJson(CASSINO_PATH);
         const saldo = saldoDe(dados, jid, sender);
         if (saldo < valor) return reply(avisoSemSaldo(saldo) + `\n\n_(aposta pedida: ${valor.toLocaleString('pt-BR')})_`);
-        if (jogo && !jogo.finished) return reply('⚠️ Você já tem um jogo em andamento! Use `' + config.prefixo + 'bj stand`.`');
+        if (jogo && !jogo.finished) return reply(`⚠️ Você já tem um jogo em andamento! Use \`${config.prefixo}bj -1\` pra parar.`);
 
         definirSaldo(dados, jid, sender, saldo - valor);
         fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
@@ -1344,8 +1447,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         }
 
         return reply(
-            textoBlackjack(jid, sender, novoJogo, saldoDe(dados, jid, sender), false) +
-            `\n\n➡️ Use \`${config.prefixo}bj hit\` ou \`${config.prefixo}bj stand\``,
+            textoBlackjack(jid, sender, novoJogo, saldoDe(dados, jid, sender), false) + dicaBlackjack(),
             [sender]
         );
     }
@@ -1569,14 +1671,103 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         return reply(`🎁 @${semSufixo(alvo)} recebeu *${valor.toLocaleString('pt-BR')}* fichas. Saldo: *${novo.toLocaleString('pt-BR')}*`, [alvo]);
     }
 
+    // Trava/destrava o grupo inteiro: so admins dos ADM falam, e so o dono
+    // do grupo consegue. Serve pra calar o grupo de madrugada e evitar
+    // notificação de madrugada.
+    if (['fechar', 'fecharg', 'fechargrupo', 'trancar', 'lock', 'silenciar'].includes(comando)) {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        try {
+            await sock.groupSettingUpdate(jid, 'locked');
+            return reply(
+                `🔒 *GRUPO FECHADO!*\n\n` +
+                `Só os administradores podem falar agora.\n` +
+                `📢 Aviso: o grupo volta a abrir com \`${config.prefixo}abrir\`.`
+            );
+        } catch (e) {
+            return reply(
+                `❌ *Não consegui fechar o grupo.*\n\n` +
+                `_${e?.message || e}_\n\n` +
+                `O bot precisa ser *admin* do grupo pra travar.`
+            );
+        }
+    }
+
+    if (['abrirg', 'abrirgrupo', 'destrancar', 'unlock', 'abrir'].includes(comando)) {
+        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        try {
+            await sock.groupSettingUpdate(jid, 'unlocked');
+            return reply(
+                `🔓 *GRUPO ABERTO!*\n\n` +
+                `Todo mundo pode falar de novo. Bom dia! ☀️`
+            );
+        } catch (e) {
+            return reply(
+                `❌ *Não consegui abrir o grupo.*\n\n` +
+                `_${e?.message || e}_\n\n` +
+                `O bot precisa ser *admin* do grupo pra destravar.`
+            );
+        }
+    }
+
     if (['cassino', 'casino'].includes(comando)) {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
         const opt = args[0]?.toLowerCase();
-        if (opt === 'on') config.cassinoAtivo = true;
-        else if (opt === 'off') config.cassinoAtivo = false;
-        else return reply(`Uso: ${config.prefixo}cassino on/off (atual: ${config.cassinoAtivo ? 'ABERTO' : 'FECHADO'})`);
+
+        // !cassino sem argumento alterna; on/off fixa o estado. Qualquer outra
+        // palavra e' erro de digitacao e nao pode acabar virando um toggle.
+        if (opt == null) {
+            config.cassinoAtivo = !config.cassinoAtivo;
+        } else if (opt === 'on') {
+            config.cassinoAtivo = true;
+        } else if (opt === 'off') {
+            config.cassinoAtivo = false;
+        } else {
+            return reply(
+                `❌ Opção inválida: *${opt}*\n\n` +
+                `\`${config.prefixo}cassino\` - Abre ou fecha\n` +
+                `\`${config.prefixo}cassino on\` - Abre\n` +
+                `\`${config.prefixo}cassino off\` - Fecha`
+            );
+        }
         salvarConfig();
-        return reply(`🎰 Cassino ${config.cassinoAtivo ? 'ABERTO' : 'FECHADO'}.`);
+
+        return reply(
+            config.cassinoAtivo
+                ? `🎰 *CASSINO ABERTO!* 🎉\n\n` +
+                  `O cassino está liberado! Todo mundo pode jogar:\n` +
+                  `• 🐯 tigrinho, 🃏 blackjack, 🎡 roleta\n` +
+                  `• 💵 fichas e 🎁 bônus diário\n\n` +
+                  `📋 \`${config.prefixo}jogos\` - Ver os jogos\n` +
+                  `🔒 \`${config.prefixo}cassino\` - Fechar o cassino`
+                : `🔒 *CASSINO FECHADO!*\n\n` +
+                  `Ninguém consegue mais apostar por enquanto.\n` +
+                  `As fichas de cada um estão guardadas. 💰\n\n` +
+                  `🔓 \`${config.prefixo}cassino\` - Abrir o cassino`
+        );
+    }
+
+    if (['jogos', 'jogatina', 'apostas'].includes(comando)) {
+        return reply(
+            `*🎰 CASSINO* 🎰\n\n` +
+            `*💰 Carteira*\n` +
+            `💵 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
+            `🎁 \`${config.prefixo}bonus\` - Bônus diário (+${config.bonusDiario})\n` +
+            `🤝 \`${config.prefixo}convidar @a @b\` - Traga ${config.convidadosNecessarios} novos (+${config.fichasPorConvidado} cada)\n` +
+            `\n` +
+            `*🕹️ Jogos*\n` +
+            `🐯 \`${config.prefixo}tigre <aposta>\` - Caça-níquel\n` +
+            `🃏 \`${config.prefixo}blackjack <aposta>\` - 21 contra a mesa\n` +
+            `   ↳ \`${config.prefixo}bj 1\` pede mais | \`${config.prefixo}bj -1\` parar\n` +
+            `🎡 \`${config.prefixo}roleta <aposta> <vermelho|preto|N 0-36>\` - Roleta\n` +
+            `\n` +
+            `*🏆 Ranking*\n` +
+            `🏅 \`${config.prefixo}recordes\` - Maiores prêmios do tigrinho\n` +
+            `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
+            (isAdmin
+                ? `\n*🎁 ADMs*\n🎁 \`${config.prefixo}dar @usuario <valor>\` - Dá fichas\n` +
+                  `🔒 \`${config.prefixo}cassino\` - Abre/fecha o cassino\n`
+                : '')
+        );
     }
 
     if (comando === 'ping') {
@@ -1597,29 +1788,30 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const menu =
             `*🤖 ${NOME_BOT_FANCY} - Menu de Comandos* 🤖\n` +
             `\n` +
-            `🛡️ *MODERAÇÃO (só ADMs)* 🛡️\n` +
-            `➕ \`${config.prefixo}addpalavra <palavra>\` - Adiciona palavra proibida\n` +
-            `➖ \`${config.prefixo}rmpalavra <palavra>\` - Remove palavra proibida\n` +
-            `📋 \`${config.prefixo}listapalavras\` - Lista palavras bloqueadas\n` +
-            `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
-            `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +
-            `🗑️ \`${config.prefixo}apagar\` - Apaga a mensagem respondida\n` +
-            `🔞 \`${config.prefixo}+18\` - Apaga foto/vídeo + advertência\n` +
+            `🧹 *LIMPEZA*\n` +
+            `🗑️ \`${config.prefixo}apagar\` - Apaga a msg respondida\n` +
+            `🧹 \`${config.prefixo}limpar\` - Apaga as msgs do bot\n` +
+            `\n` +
+            `🚨 *PUNIÇÕES*\n` +
+            `🔞 \`${config.prefixo}+18\` - Apaga foto/vídeo + adverte\n` +
+            `🚫 \`${config.prefixo}ban\` - Bane (marca ou responde)\n` +
             `♻️ \`${config.prefixo}zerar @usuario\` - Zera advertências\n` +
-            `🚫 \`${config.prefixo}ban\` - Bane (marca ou responde a msg)\n` +
-            `🗑️ \`${config.prefixo}limpar\` - Apaga mensagens do bot\n` +
             `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
             `\n` +
+            `📝 *PALAVRAS*\n` +
+            `➕ \`${config.prefixo}addpalavra <p>\` - Bloqueia palavra\n` +
+            `➖ \`${config.prefixo}rmpalavra <p>\` - Libera palavra\n` +
+            `📋 \`${config.prefixo}listapalavras\` - Ver bloqueadas\n` +
+            `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
+            `\n` +
+            `⚙️ *AJUSTES*\n` +
+            `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +
+            `🔒 \`${config.prefixo}cassino\` - Abre/fecha o cassino\n` +
+            `🔒 \`${config.prefixo}fechar\` - Fecha o grupo (só ADMs falam)\n` +
+            `🔓 \`${config.prefixo}abrir\` - Abre o grupo\n` +
+            `\n` +
             `🎰 *CASSINO* 🎰\n` +
-            `💰 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
-            `🎁 \`${config.prefixo}bonus\` - Bônus diário (+2)\n` +
-            `🎁 \`${config.prefixo}convidar @a @b\` - Traga 2 novos (+10 cada)\n` +
-            `🎡 \`${config.prefixo}roleta <aposta> <aposta>\` - Roleta russa\n` +
-            `🐯 \`${config.prefixo}tigre <aposta>\` - Caça-níquel\n` +
-            `🃏 \`${config.prefixo}blackjack <aposta>\` - 21 contra a mesa\n` +
-            `🏆 \`${config.prefixo}recordes\` - Maiores premios do tigrinho\n` +
-            `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
-            `🎁 \`${config.prefixo}dar @usuario <valor>\` - Dá fichas (ADMs)\n` +
+            `🎰 \`${config.prefixo}jogos\` - Ver jogos e fichas\n` +
             `\n` +
             `📡 *GERAL* 📡\n` +
             `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +
@@ -1638,14 +1830,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `⚠️ \`${config.prefixo}advertencias\` - Vê advertências\n` +
             `\n` +
             `🎰 *CASSINO* 🎰\n` +
-            `💰 \`${config.prefixo}saldo\` - Vê suas fichas\n` +
-            `🎁 \`${config.prefixo}bonus\` - Bônus diário (+2)\n` +
-            `🎁 \`${config.prefixo}convidar @a @b\` - Traga 2 novos (+10 cada)\n` +
-            `🎡 \`${config.prefixo}roleta <aposta> <aposta>\` - Roleta russa\n` +
-            `🐯 \`${config.prefixo}tigre <aposta>\` - Caça-níquel\n` +
-            `🃏 \`${config.prefixo}blackjack <aposta>\` - 21 contra a mesa\n` +
-            `🏆 \`${config.prefixo}recordes\` - Maiores premios do tigrinho\n` +
-            `📊 \`${config.prefixo}ranking\` - Ranking de saldo\n` +
+            `🎰 \`${config.prefixo}jogos\` - Ver jogos e fichas\n` +
             `\n` +
             `📡 *GERAL* 📡\n` +
             `🖼️ \`${config.prefixo}s\` - Cria figurinha\n` +

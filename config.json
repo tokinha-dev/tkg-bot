@@ -26,7 +26,7 @@
     "554898195564",
     "5511995485573"
   ],
-  "dryRun": true,
+  "dryRun": false,
   "bloquearViewOnce": true,
   "cacheMetadataMs": 30000,
   "cassinoAtivo": true,
