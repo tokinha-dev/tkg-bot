@@ -8,7 +8,7 @@ const CONFIG_PATH = './config.json';
 const WARNINGS_PATH = './warnings.json';
 const AUTH_FOLDER = './auth_info';
 
-const NOME_BOT_FANCY = '𝐟𝐚𝐦𝐢𝐥𝐢𝐚-𝟏𝟓𝟕-𝐛𝐨𝐭';
+const NOME_BOT_FANCY = '𝐟𝐚𝐦𝐢𝐥𝐢𝐚-𝟏𝟕𝟏-𝐛𝐨𝐭';
 
 const mensagensBot = {};
 
@@ -20,11 +20,12 @@ function aplicarPadroes(c) {
     c.acaoAposMax ??= 'remover';
     c.mensagemAdvertencia ??= 'mensagem não permitida! ⚠️ Advertência {atual}/{max}';
     c.mensagemBoasVindas ??=
-        `🎉 *BEM-VINDO(A) À FAMÍLIA 157* 🎉\n` +
-        `👤 {nome} acabou de entrar no grupo *{grupo}*\n` +
+        `🎉 *BEM-VINDO(A) À FAMÍLIA 171* 🎉\n` +
+        `👤 {user} acabou de entrar no grupo *{grupo}*\n` +
         `\n` +
         `📖 Leia a descrição e se divirta!`;
     c.mensagemBanAdmin ??= 'kkkkkk você não pode banir esse tchola🤷‍♂️🤣';
+    c.mensagemAtivacao ??= 'bot ativado✅\n\num abraço do tokinha❤ \npara usar o bot digite **!ajuda**';
     c.antilink ??= true;
     c.palavrasProibidas ??= [];
     c.linkRegex ??= [];
@@ -73,6 +74,37 @@ function digitos(valor) {
 
 function semSufixo(jid) {
     return String(jid || '').split('@')[0];
+}
+
+// Algumas versoes do WhatsApp entregam o campo de nome como objeto em vez de
+// texto, as vezes aninhado. A boa-vinda usava direto e saia "[object Object]".
+// Aqui so vale texto, e se nao achar nada devolve string vazia (nunca "[object").
+function textoLimpo(valor, profundidade = 0) {
+    if (typeof valor === 'string') return valor.trim();
+    if (!valor || typeof valor !== 'object' || profundidade > 3) return '';
+    for (const k of ['text', 'value', 'name', 'notifyName', 'displayName', 'pushName', 'nome']) {
+        const t = textoLimpo(valor[k], profundidade + 1);
+        if (t) return t;
+    }
+    return '';
+}
+
+/** Nome de exibicao, do mais bonito pro mais pobre. */
+function nomeDe(p, alvoId) {
+    for (const c of [p?.name, p?.notifyName, p?.verifiedName, p?.pushName, p?.displayName, p?.phoneNumber, p?.phone_number]) {
+        const t = textoLimpo(c);
+        if (t) return t;
+    }
+    return semSufixo(alvoId);
+}
+
+/** Telefone com @s.whatsapp.net, que e o que a mencao do WhatsApp exige. */
+function telefoneDe(p, alvoId) {
+    for (const c of [p?.phoneNumber, p?.phone_number, p?.jnid, p?.id, alvoId]) {
+        const t = textoLimpo(c);
+        if (t.includes('@s.whatsapp.net')) return t;
+    }
+    return null;
 }
 
 // Constrói o "corpo" tolerante: espaço vira \s+, hífen vira separador opcional
@@ -714,22 +746,25 @@ async function iniciarBot() {
                 try {
                     const p = metadata ? acharParticipante(metadata.participants, ref) : null;
                     const alvoId = p?.id || ref;
-                    const nome = p?.name || p?.notifyName || semSufixo(alvoId);
-                    const pn = p?.phoneNumber || (String(alvoId).endsWith('@s.whatsapp.net') ? alvoId : null);
+                    const nome = nomeDe(p, alvoId);
+                    const pn = telefoneDe(p, alvoId);
+                    // Para o WhatsApp MARCAR a pessoa, o @numero tem que estar
+                    // no texto E na lista de mencoes. Sem o @ no texto a lista
+                    // sozinha nao desenha a marcacao.
+                    const marcado = pn ? `@${semSufixo(pn)}` : nome;
                     const texto = config.mensagemBoasVindas
+                        .replace(/{user}/g, marcado)
                         .replace(/{nome}/g, nome)
                         .replace(/{grupo}/g, groupName);
 
-                    // Menção por LID (@lid) derruba o envio com 400, e menção vazia
-                    // também. Só marca quando temos o telefone; senão texto puro.
                     try {
                         if (pn) await sock.sendMessage(id, { text: texto, mentions: [pn] });
                         else await sock.sendMessage(id, { text: texto });
                     } catch (e) {
                         console.log(` [BOAS-VINDAS] menção falhou (${e?.message || e}), mandando texto puro`);
-                        await sock.sendMessage(id, { text: texto });
+                        await sock.sendMessage(id, { text: texto.replace(marcado, nome) });
                     }
-                    console.log(` [BOAS-VINDAS] ${alvoId} em ${id} | nome=${nome}`);
+                    console.log(` [BOAS-VINDAS] ${alvoId} em ${id} | nome=${nome} | telefone=${pn ? 'sim' : 'nao'}`);
                 } catch (e) {
                     console.log(` [BOAS-VINDAS] falhou para ${ref} em ${id}: ${e?.message || e}`);
                 }
@@ -774,17 +809,19 @@ async function iniciarBot() {
                     const senha = partes.join(' ');
                     const espera = grupoBloqueadoPorTentativas(jid);
 
+                    // Apaga PRIMEIRO, antes de qualquer outra coisa. Comparar o
+                    // hash e' instantaneo, mas liberarGrupo() escreve o
+                    // config.json em disco e segura o event loop alguns ms.
+                    // Apagando antes, a senha fica no chat pelo menor tempo
+                    // possivel. Isso e' o que segura o "ninguem ve".
+                    await apagarMensagem(sock, jid, msg.key);
+
                     if (senhaConfere(senha)) {
                         liberarGrupo(jid);
-                        await apagarMensagem(sock, jid, msg.key);
-                        return void sock.sendMessage(
-                            jid,
-                            { text: '🔓 *Ativado!*\n\nJá sou seu nesse grupo. Pode usar `!ajuda`.' }
-                        );
+                        return void sock.sendMessage(jid, { text: config.mensagemAtivacao });
                     }
 
                     registrarTentativa(jid);
-                    await apagarMensagem(sock, jid, msg.key);
                     if (espera > 0) {
                         return void sock.sendMessage(
                             jid,
@@ -924,7 +961,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         return reply(`✅ Advertências de @${semSufixo(alvo)} zeradas.`, [alvo]);
     }
 
-    if (comando === 'apagar' || comando === 'del' || comando === 'deletar') {
+    if (comando === 'apagar' || comando === 'apaga' || comando === 'del' || comando === 'deletar') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
         if (!isBotAdmin) return reply('❌ Eu não sou admin aqui, então o WhatsApp não deixa eu apagar mensagem de outra pessoa.');
         const ctx = msg.message?.extendedTextMessage?.contextInfo;
@@ -1049,6 +1086,10 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
                 `Quem controla isso é o dono do bot, não os admins do grupo.`
             );
         }
+        // Aqui o grupo JA esta ligado, entao a mensagem chegou ate handleComandos.
+        // Mesmo assim a senha nao pode ficar na conversa: apaga sempre, antes
+        // de responder qualquer coisa.
+        await apagarMensagem(sock, jid, msg.key);
         if (grupoLiberado(jid)) {
             return reply(`🔓 O bot já está ligado neste grupo.`);
         }
@@ -1056,7 +1097,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             return reply(`❌ Senha incorreta.`);
         }
         liberarGrupo(jid);
-        return reply(`🔓 *Bot ligado neste grupo!*\n\nJá posso responder. Use \`${config.prefixo}ajuda\` para ver os comandos.`);
+        return reply(config.mensagemAtivacao);
     }
 
     if (['fechar', 'fecharg', 'fechargrupo', 'trancar', 'lock', 'silenciar'].includes(comando)) {

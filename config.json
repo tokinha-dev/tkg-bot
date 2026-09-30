@@ -1,11 +1,12 @@
 {
-  "nomeBot": "familia-157-bot",
+  "nomeBot": "familia-171-bot",
   "prefixo": "!",
   "numeroBot": "",
   "maxAdvertencias": 3,
   "acaoAposMax": "remover",
   "mensagemAdvertencia": "links e mensagens da descrição não são permitidos! ⚠️ Advertência {atual}/{max}",
-  "mensagemBoasVindas": "🎉 *BEM-VINDO(A) À FAMÍLIA 157* 🎉\n👤 {nome} acabou de entrar no grupo *{grupo}*\n\n📖 Leia a descrição e se divirta!",
+  "mensagemBoasVindas": "🎉 *BEM-VINDO(A) À FAMÍLIA 171* 🎉\n👤 {user} acabou de entrar no grupo *{grupo}*\n\n📖 Leia a descrição e se divirta!",
+  "mensagemAtivacao": "bot ativado✅\n\num abraço do tokinha❤ \npara usar o bot digite **!ajuda**",
   "mensagemBanAdmin": "kkkkkk você não pode banir esse tchola🤷‍♂️🤣",
   "antilink": true,
   "palavrasProibidas": [
