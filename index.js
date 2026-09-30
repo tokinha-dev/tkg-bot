@@ -2,6 +2,7 @@ import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaile
 import qrcode from 'qrcode-terminal';
 import fs from 'node:fs';
 import pino from 'pino';
+import crypto from 'node:crypto';
 
 const CONFIG_PATH = './config.json';
 const WARNINGS_PATH = './warnings.json';
@@ -28,6 +29,11 @@ function aplicarPadroes(c) {
     c.palavrasProibidas ??= [];
     c.linkRegex ??= [];
     c.gruposPermitidos ??= [];
+    // A senha nao fica aqui. O config.json vai pro GitHub, que e publico:
+    // guardar o segredo nele entregaria a chave de todos os grupos. Vai so
+    // o SHA-256, que nao da pra voltar pra senha.
+    c.senhaHash ??= process.env.SENHA_BOT_HASH || '';
+    c.gruposLiberados ??= [];
     c.ignorarAdmins ??= true;
     c.ignorarDono ??= true;
     c.donos ??= [];
@@ -111,12 +117,16 @@ function regexPalavraProibida(palavra) {
             const bordaEsq = '(?<![\\p{L}\\p{N}])';
             const bordaDir = '(?![\\p{L}\\p{N}])';
 
+            // ^ e $ ancoram de verdade. Antes so viravam fronteira de palavra,
+            // entao "^pix$" pegava "meu pix foi aprovado" do mesmo jeito.
+            const esq = inicio ? '^' : bordaEsq;
+            const dir = fim ? '$' : bordaDir;
+
             let padrao;
             if (comCuringa && palavraSimples) padrao = `\\p{L}*${nuc}[\\p{L}\\p{N}]*`;
             else if (comCuringa) padrao = nuc;
-            else if (inicio) padrao = `${bordaEsq}${nuc}${bordaDir}`;
-            else if (fim) padrao = `${bordaEsq}\\p{L}*${nuc}${bordaDir}`;
-            else padrao = `${bordaEsq}${nuc}${bordaDir}`;
+            else if (fim) padrao = `${esq}\\p{L}*${nuc}${dir}`;
+            else padrao = `${esq}${nuc}${dir}`;
 
             try {
                 re = new RegExp(padrao, 'iu');
@@ -154,6 +164,63 @@ function contemConteudoProibido(texto) {
     }
 
     return { proibido: false };
+}
+
+// ====================== SENHA ======================
+// O grupo nao e seu, mas o bot e' seu. O dono cria UMA senha no config. Em
+// qualquer grupo que o bot entre, ele fica mudo como usuario comum ate alguem
+// digitar `!senha <a senha>`. Ninguem mais controla isso: nem ADM do grupo.
+const tentativasSenha = new Map(); // jid -> { n, ate }
+const MAX_TENTATIVAS = 5;
+const BLOQUEIO_MS = 10 * 60 * 1000;
+
+function hashSenha(txt) {
+    return crypto.createHash('sha256').update(String(txt)).digest('hex');
+}
+
+function temSenha() {
+    return Boolean(config.senhaHash);
+}
+
+/** Com senha no config, so funciona em grupo que ja foi liberado. */
+function grupoLiberado(jid) {
+    if (!temSenha()) return true;
+    return config.gruposLiberados.includes(jid);
+}
+
+// O config guarda o SHA-256 da senha, entao compara o hash do que a pessoa
+// digitou direto com o que esta no arquivo. Nao hasheia o hash de novo.
+function senhaConfere(tentativa) {
+    if (!temSenha() || !tentativa) return false;
+    const a = Buffer.from(hashSenha(tentativa), 'hex');
+    const b = Buffer.from(String(config.senhaHash), 'hex');
+    if (a.length !== b.length || a.length === 0) return false;
+    return crypto.timingSafeEqual(a, b);
+}
+
+function grupoBloqueadoPorTentativas(jid) {
+    const t = tentativasSenha.get(jid);
+    if (!t || !t.ate) return 0;
+    if (Date.now() < t.ate) return Math.ceil((t.ate - Date.now()) / 1000);
+    tentativasSenha.delete(jid);
+    return 0;
+}
+
+function registrarTentativa(jid) {
+    const t = tentativasSenha.get(jid) || { n: 0, ate: 0 };
+    if (t.ate && Date.now() < t.ate) return;
+    if (t.ate) t.ate = 0;
+    t.n++;
+    if (t.n >= MAX_TENTATIVAS) t.ate = Date.now() + BLOQUEIO_MS;
+    tentativasSenha.set(jid, t);
+}
+
+function liberarGrupo(jid) {
+    if (!config.gruposLiberados.includes(jid)) {
+        config.gruposLiberados.push(jid);
+        salvarConfig();
+    }
+    tentativasSenha.delete(jid);
 }
 
 function validarPadroesLink() {
@@ -256,6 +323,9 @@ async function aplicarAgendamentoGrupo(sock, agora = new Date()) {
     const grupos = await sock.groupFetchAllParticipating();
     const resultados = [];
     for (const grupoJid of Object.keys(grupos || {})) {
+        // Nao mexe em grupo bloqueado: nem por senha, nem por lista de permitidos.
+        if (config.gruposPermitidos.length > 0 && !config.gruposPermitidos.includes(grupoJid)) continue;
+        if (!grupoLiberado(grupoJid)) continue;
         const chave = `${grupoJid}|${partes.data}|${acao}`;
         if (autoGrupoFeito.has(chave)) continue;
         try {
@@ -351,16 +421,6 @@ function ehDono(ref, participants) {
     const cands = [ref, p?.id, p?.lid, p?.phoneNumber].filter(Boolean).map(digitos).filter(Boolean);
     const lista = config.donos.map(digitos).filter(Boolean);
     return cands.some(c => lista.includes(c));
-}
-
-/** Link de convite do grupo. Devolve null se o bot nao conseguir (permissao). */
-async function linkDoGrupo(sock, jid) {
-    try {
-        const code = await sock.groupInviteCode(jid);
-        return code ? `https://chat.whatsapp.com/${code}` : null;
-    } catch {
-        return null;
-    }
 }
 
 function ehProtegido(sock, sender, participants) {
@@ -637,7 +697,8 @@ async function iniciarBot() {
             const { id, participants, action } = update;
             cacheMetadata.delete(id);
             aliasPorGrupo.delete(id);
-            console.log(` [BOAS-VINDAS] evento ${action} em ${id}: ${JSON.stringify(participants)}`);
+            if (config.gruposPermitidos.length > 0 && !config.gruposPermitidos.includes(id)) return;
+            if (!grupoLiberado(id)) return;
             if (action !== 'add' || !Array.isArray(participants) || !participants.length) return;
 
             let metadata = null;
@@ -701,6 +762,37 @@ async function iniciarBot() {
 
                 if (config.gruposPermitidos.length > 0 && !config.gruposPermitidos.includes(jid)) continue;
 
+                // Grupo nao liberado: o bot e' so mais um usuario. O unico jeito
+                // de ele acordar aqui e' `!senha <a senha do dono>`.
+                if (!grupoLiberado(jid)) {
+                    const t = getTextoMensagem(msg);
+                    if (!t || !t.startsWith(config.prefixo)) continue;
+                    const partes = t.slice(config.prefixo.length).trim().split(/ +/);
+                    const cmd = (partes.shift() || '').toLowerCase();
+                    if (cmd !== 'senha') continue;
+
+                    const senha = partes.join(' ');
+                    const espera = grupoBloqueadoPorTentativas(jid);
+
+                    if (senhaConfere(senha)) {
+                        liberarGrupo(jid);
+                        await apagarMensagem(sock, jid, msg.key);
+                        return void sock.sendMessage(
+                            jid,
+                            { text: '🔓 *Ativado!*\n\nJá sou seu nesse grupo. Pode usar `!ajuda`.' }
+                        );
+                    }
+
+                    registrarTentativa(jid);
+                    await apagarMensagem(sock, jid, msg.key);
+                    if (espera > 0) {
+                        return void sock.sendMessage(
+                            jid,
+                            { text: `⏳ Muitas tentativas erradas. Tente de novo em ${Math.ceil(espera / 60)} min.` }
+                        );
+                    }
+                }
+
                 const texto = getTextoMensagem(msg);
                 const senderBruto = msg.key.participant || msg.key.senderPn || msg.participant;
                 if (!senderBruto) continue;
@@ -722,6 +814,14 @@ async function iniciarBot() {
                 }
 
                 if (!texto) continue;
+
+                // A senha nao pode ficar registrada no chat. Em grupo liberado
+                // ninguem precisa reenviar, entao qualquer `!senha <certo>` e
+                // apagado na hora.
+                if (temSenha() && senhaConfere(texto.slice(config.prefixo.length).trim().replace(/^senha\s+/i, ''))) {
+                    await apagarMensagem(sock, jid, msg.key);
+                    continue;
+                }
 
                 if (texto.startsWith(config.prefixo)) {
                     await handleComandos(sock, msg, jid, texto, sender, metadata);
@@ -942,8 +1042,23 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         }
     }
 
-    // Fecha/abre a conversa do grupo: só ADMs falam quando fechado. O bot
-    // precisa ser admin do grupo. Serve pra calar o grupo de madrugada.
+    if (comando === 'senha' || comando === 'ativar' || comando === 'ligarbot') {
+        if (!temSenha()) {
+            return reply(
+                `🔓 O bot ainda não tem senha configurada.\n\n` +
+                `Quem controla isso é o dono do bot, não os admins do grupo.`
+            );
+        }
+        if (grupoLiberado(jid)) {
+            return reply(`🔓 O bot já está ligado neste grupo.`);
+        }
+        if (!senhaConfere(args.join(' '))) {
+            return reply(`❌ Senha incorreta.`);
+        }
+        liberarGrupo(jid);
+        return reply(`🔓 *Bot ligado neste grupo!*\n\nJá posso responder. Use \`${config.prefixo}ajuda\` para ver os comandos.`);
+    }
+
     if (['fechar', 'fecharg', 'fechargrupo', 'trancar', 'lock', 'silenciar'].includes(comando)) {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
         try {
@@ -987,6 +1102,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         return reply(
             `🩺 Status do bot\n` +
             `Palavras: ${config.palavrasProibidas.length} | Antilink: ${config.antilink ? 'ON' : 'OFF'}\n` +
+            `Bot aqui: ${grupoLiberado(jid) ? 'ligado' : 'aguardando senha'}\n` +
             `Sou admin aqui: ${isBotAdmin ? 'sim' : 'NÃO'}${isBotAdmin ? '' : ' (não apago nem bano)'}\n` +
             `Ignorar admins: ${config.ignorarAdmins ? 'ON' : 'OFF'} | Ignorar dono: ${config.ignorarDono ? 'ON' : 'OFF'}`
         );
@@ -1011,6 +1127,8 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `➖ \`${config.prefixo}rmpalavra <p>\` - Libera palavra\n` +
             `📋 \`${config.prefixo}listapalavras\` - Ver bloqueadas\n` +
             `🧪 \`${config.prefixo}teste <texto>\` - Simula a detecção\n` +
+            `\n` +
+            `🔐 \`${config.prefixo}senha <senha>\` - Liga o bot neste grupo\n` +
             `\n` +
             `⚙️ *AJUSTES*\n` +
             `🔗 \`${config.prefixo}antilink on/off\` - Liga/desliga anti-link\n` +

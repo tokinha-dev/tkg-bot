@@ -9,7 +9,16 @@
   "mensagemBanAdmin": "kkkkkk você não pode banir esse tchola🤷‍♂️🤣",
   "antilink": true,
   "palavrasProibidas": [
-    "pix"
+    "^pix$",
+    "pix:",
+    "faz pix",
+    "fazer pix",
+    "faz um pix",
+    "fazer um pix",
+    "fazer o pix",
+    "manda pix",
+    "mande pix",
+    "passa o pix"
   ],
   "linkRegex": [
     "https?://",
@@ -20,6 +29,8 @@
     "chat\\.whatsapp\\.com"
   ],
   "gruposPermitidos": [],
+  "senhaHash": "1c2e6afd7534a2a397e2a56a5f06dfeeba666ce5320599f74b0a3f45502e8da8",
+  "gruposLiberados": [],
   "ignorarAdmins": true,
   "ignorarDono": true,
   "donos": [
