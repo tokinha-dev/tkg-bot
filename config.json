@@ -34,5 +34,9 @@
   "saldoInicial": 10,
   "bonusDiario": 2,
   "convidadosNecessarios": 2,
-  "fichasPorConvidado": 10
+  "fichasPorConvidado": 10,
+  "fusoHorarioGrupo": "Africa/Luanda",
+  "abrirGrupoHora": 5,
+  "fecharGrupoHora": 0,
+  "grupoAuto": true
 }

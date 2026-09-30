@@ -44,6 +44,10 @@ function aplicarPadroes(c) {
     c.bonusDiario ??= 2;
     c.fichasPorConvidado ??= 10;
     c.cacheMetadataMs ??= 30000;
+    c.fusoHorarioGrupo ??= 'Africa/Luanda';
+    c.abrirGrupoHora ??= 5;
+    c.fecharGrupoHora ??= 0;
+    c.grupoAuto ??= true;
     return c;
 }
 
@@ -73,6 +77,39 @@ function digitos(valor) {
 
 function semSufixo(jid) {
     return String(jid || '').split('@')[0];
+}
+
+const NUMEROS_PT = {
+    zero: 0, um: 1, uma: 1, dois: 2, duas: 2, tres: 3, quatro: 4, cinco: 5,
+    seis: 6, sete: 7, oito: 8, nove: 9, dez: 10, onze: 11, doze: 12,
+    treze: 13, quatorze: 14, catorze: 14, quinze: 15, dezesseis: 16,
+    dezessete: 17, dezoito: 18, dezenove: 19, vinte: 20
+};
+
+function extrairInteiro(tokens) {
+    for (let i = tokens.length - 1; i >= 0; i--) {
+        const token = String(tokens[i] || '');
+        const dig = token.replace(/[^0-9-]/g, '');
+        if (/^-?\d+$/.test(dig)) return parseInt(dig, 10);
+        const palavra = normalizar(token);
+        if (Object.hasOwn(NUMEROS_PT, palavra)) return NUMEROS_PT[palavra];
+    }
+    return null;
+}
+
+function acharParticipantePorTexto(participants, texto) {
+    const limpo = String(texto || '').replace(/^@/, '').trim();
+    if (!limpo) return null;
+    const num = digitos(limpo);
+    if (num.length >= 5) {
+        const porNumero = acharParticipante(participants, num);
+        if (porNumero) return porNumero;
+    }
+    const alvo = normalizar(limpo);
+    return (participants || []).find(p => {
+        const ids = [p.id, p.lid, p.phoneNumber].filter(Boolean).map(x => normalizar(semSufixo(x)));
+        return ids.some(id => id && (id === alvo || id.endsWith(alvo) || alvo.endsWith(id)));
+    }) || null;
 }
 
 // Constrói o "corpo" tolerante: espaço vira \s+, hífen vira separador opcional
@@ -260,6 +297,96 @@ function registrarAliases(jid, participants) {
     return mapa;
 }
 
+const autoGrupoFeito = new Map();
+let timerGrupoAuto = null;
+let sockGrupoAuto = null;
+
+function partesNaZona(agora, zona) {
+    try {
+        const partes = {};
+        new Intl.DateTimeFormat('en-CA', {
+            timeZone: zona,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit',
+            hourCycle: 'h23'
+        }).formatToParts(agora).forEach(p => { partes[p.type] = p.value; });
+        return {
+            data: `${partes.year}-${partes.month}-${partes.day}`,
+            hora: Number(partes.hour),
+            minuto: Number(partes.minute)
+        };
+    } catch {
+        return null;
+    }
+}
+
+function acaoGrupoAgendada(hora, minuto, abrirHora, fecharHora) {
+    if (!Number.isInteger(hora) || !Number.isInteger(minuto)) return null;
+    if (!Number.isInteger(abrirHora) || !Number.isInteger(fecharHora)) return null;
+    if (abrirHora === fecharHora) return null;
+    if (minuto !== 0) return null;
+    if (hora === abrirHora) return 'aberta';
+    if (hora === fecharHora) return 'fechada';
+    return null;
+}
+
+async function aplicarAgendamentoGrupo(sock, agora = new Date()) {
+    if (!config.grupoAuto) return [];
+    const partes = partesNaZona(agora, config.fusoHorarioGrupo);
+    if (!partes) return [];
+    const acao = acaoGrupoAgendada(partes.hora, partes.minuto, config.abrirGrupoHora, config.fecharGrupoHora);
+    if (!acao) return [];
+
+    const grupos = await sock.groupFetchAllParticipating();
+    const resultados = [];
+    for (const grupoJid of Object.keys(grupos || {})) {
+        const chave = `${grupoJid}|${partes.data}|${acao}`;
+        if (autoGrupoFeito.has(chave)) continue;
+        try {
+            const metadata = await pegarMetadata(sock, grupoJid);
+            const travado = metadata?.announce === true;
+            const desejaTravar = acao === 'fechada';
+            if (travado === desejaTravar) {
+                autoGrupoFeito.set(chave, Date.now());
+                resultados.push({ grupo: grupoJid, acao, aplicada: false, motivo: 'ja-no-estado' });
+                continue;
+            }
+            await sock.groupSettingUpdate(grupoJid, desejaTravar ? 'announcement' : 'not_announcement');
+            await sock.sendMessage(grupoJid, {
+                text: desejaTravar
+                    ? `🔒 *GRUPO FECHADO!*\n\nSó os administradores podem falar agora. Boa noite! 🌙\n\nTambém dá para controlar com \`${config.prefixo}abrir\` e \`${config.prefixo}fechar\`.`
+                    : `🔓 *GRUPO ABERTO!*\n\nTodo mundo pode falar de novo. Bom dia! ☀️\n\nTambém dá para controlar com \`${config.prefixo}abrir\` e \`${config.prefixo}fechar\`.`
+            });
+            autoGrupoFeito.set(chave, Date.now());
+            resultados.push({ grupo: grupoJid, acao, aplicada: true });
+        } catch (e) {
+            resultados.push({ grupo: grupoJid, acao, aplicada: false, motivo: e?.message || String(e) });
+        }
+    }
+
+    if (autoGrupoFeito.size > 500) {
+        const limite = Date.now() - 36 * 60 * 60 * 1000;
+        for (const [chave, quando] of autoGrupoFeito) {
+            if (quando < limite) autoGrupoFeito.delete(chave);
+        }
+    }
+    return resultados;
+}
+
+function iniciarAgendamentoGrupo(sock) {
+    sockGrupoAuto = sock;
+    if (timerGrupoAuto) return;
+    const verificar = () => {
+        if (!sockGrupoAuto) return;
+        aplicarAgendamentoGrupo(sockGrupoAuto).catch(e => console.log('Erro no agendamento do grupo:', e?.message || e));
+    };
+    verificar();
+    timerGrupoAuto = setInterval(verificar, 20000);
+}
+
 function aliasesDe(jid, ref) {
     if (!ref) return [];
     const mapa = aliasPorGrupo.get(jid);
@@ -398,7 +525,7 @@ const TIPOS_MIDIA = ['imagem', 'imagem-efemera', 'video', 'video-efemero', 'figu
  * Key da mensagem citada. Usa a key original guardada no cache (tem o participant
  * correto, o WhatsApp exige) e só remonta como último recurso.
  */
-function chaveCitada(ctx, jid) {
+function chaveCitada(ctx, jid, participants) {
     if (!ctx?.stanzaId) return null;
     const guardada = cacheKeys.get(`${jid}|${ctx.stanzaId}`);
     if (guardada) {
@@ -409,7 +536,8 @@ function chaveCitada(ctx, jid) {
             participant: guardada.participant
         };
     }
-    return { remoteJid: jid, id: ctx.stanzaId, fromMe: false, participant: ctx.participant || undefined };
+    const p = ctx.participant ? acharParticipante(participants || [], ctx.participant) : null;
+    return { remoteJid: jid, id: ctx.stanzaId, fromMe: false, participant: p?.id || ctx.participant || undefined };
 }
 
 /**
@@ -478,55 +606,66 @@ async function aplicarAdvertencia(sock, jid, alvo, motivo, key) {
 // ====================== CASSINO ======================
 const VERMELHOS = new Set([1, 3, 5, 7, 9, 12, 14, 16, 18, 19, 21, 23, 25, 27, 30, 32, 34, 36]);
 
-// Ordem real da roda da roleta europeia. O zero fica no centro da mandala e
-// os 36 restantes giram em volta nessa ordem, entao a roda "conta" igual a de
-// verdade quando a bola vai parando.
+// Ordem real da roda da roleta europeia. A faixa compacta mostra a bola com os
+// vizinhos verdadeiros, por isso a sequência inclui o zero entre 26 e 32.
 const ORDEM_ROLETA = [
     32, 15, 19, 4, 21, 2, 25, 17, 34, 6, 27, 13, 36, 11, 30, 8, 23, 10,
     5, 24, 16, 33, 1, 20, 14, 31, 9, 22, 18, 29, 7, 28, 12, 35, 3, 26
 ];
+const SEQUENCIA_ROLETA = [0, ...ORDEM_ROLETA];
 
-// Desenha a mandala da roleta numa grade de texto. Cada numero vira um emoji
-// colorido + o numero, com o 0 (branco) no centro. `bola` troca o coracao do
-// numero sorteado pela bola vermelha, que e o efeito de "a bola parou aqui".
-function desenharMandala(bola) {
-    const L = 59, A = 29, cx = 29, cy = 14, rx = 26.5, ry = 13;
-    const grade = Array.from({ length: A }, () => new Array(L).fill(' '));
-    const livre = (l, c) => l >= 0 && l < A && c >= 0 && c < L && grade[l][c] === ' ';
-
-    // Escreve centralizando o texto; se bater em outro numero, tenta a linha
-    // vizinha ate achar espaço (mantem a roda legível mesmo se as bordas
-    // ficarem apertadas no topo, onde o circulo achata).
-    function poe(linha, coluna, txt) {
-        for (const d of [0, -1, 1, -2, 2, -3, 3, -4, 4, -5, 5]) {
-            const l = linha + d;
-            const x0 = coluna - Math.floor(txt.length / 2);
-            let cabe = true;
-            for (let k = 0; k < txt.length; k++) {
-                if (!livre(l, x0 + k)) { cabe = false; break; }
-            }
-            if (cabe) {
-                for (let k = 0; k < txt.length; k++) grade[l][x0 + k] = txt[k];
-                return;
-            }
-        }
-    }
-
-    const anguloDe = {};
-    ORDEM_ROLETA.forEach((num, k) => {
-        const ang = (k * 2 * Math.PI) / ORDEM_ROLETA.length - Math.PI / 2;
-        anguloDe[num] = ang;
-        const txt = num === bola
-            ? '\u{1F534}' + num
-            : VERMELHOS.has(num) ? '\u2764' + num : '\u{1F5A4}' + num;
-        poe(Math.round(cy + ry * Math.sin(ang)), Math.round(cx + rx * Math.cos(ang)), txt);
-    });
-    // o 0 fica sempre visivel no miolo; so vira bola vermelha quando foi ele
-    // que saiu. Durante o giro o centro continua branco, senao o 0 sumiria.
-    poe(cy, cx, bola === 0 ? '\u{1F534}0' : '\u{1F90D}0');
-
-    return grade.map(l => l.join('').replace(/\s+$/, '')).join('\n');
+function rotuloRoleta(numero, destaque = false) {
+    if (destaque) return `🔴${numero}`;
+    if (numero === 0) return '🤍0';
+    return `${VERMELHOS.has(numero) ? '❤️' : '🖤'}${numero}`;
 }
+
+function desenharFaixaRoleta(foco) {
+    const total = SEQUENCIA_ROLETA.length;
+    const i = SEQUENCIA_ROLETA.indexOf(foco);
+    if (i < 0) return `🎡 🔴${foco}`;
+    const vizinho = (d) => SEQUENCIA_ROLETA[(i + d + total) % total];
+    return `🎡 ${rotuloRoleta(vizinho(-1))} ➡️ ${rotuloRoleta(foco, true)} ⬅️ ${rotuloRoleta(vizinho(1))}`;
+}
+
+const ESCOLHAS_ROLETA = new Map([
+    ['vermelho', 'vermelho'], ['vermelha', 'vermelho'], ['red', 'vermelho'], ['verm', 'vermelho'], ['vm', 'vermelho'], ['v', 'vermelho'],
+    ['preto', 'preto'], ['preta', 'preto'], ['black', 'preto'], ['pre', 'preto'], ['pr', 'preto'],
+    ['par', 'par'], ['pares', 'par'], ['even', 'par'],
+    ['impar', 'impar'], ['impares', 'impar'], ['odd', 'impar'], ['i', 'impar'],
+    ['baixo', 'baixo'], ['baixa', 'baixo'], ['baixos', 'baixo'], ['low', 'baixo'], ['b', 'baixo'], ['1-18', 'baixo'], ['1a18', 'baixo'],
+    ['alto', 'alto'], ['alta', 'alto'], ['altos', 'alto'], ['high', 'alto'], ['a', 'alto'], ['19-36', 'alto'], ['19a36', 'alto'],
+    ['zero', 'numero:0'], ['verde', 'numero:0']
+]);
+
+function normalizarEscolhaRoleta(token) {
+    const t = normalizar(token);
+    if (ESCOLHAS_ROLETA.has(t)) return ESCOLHAS_ROLETA.get(t);
+    if (/^\d{1,2}$/.test(t)) {
+        const alvo = parseInt(t, 10);
+        if (alvo >= 0 && alvo <= 36) return `numero:${alvo}`;
+    }
+    return null;
+}
+
+function interpretarApostaRoleta(args, apostaMinima) {
+    const uso = `Uso: ${config.prefixo}rl 10 vermelho\nTambém vale ${config.prefixo}rl vermelho 10. Número direto: ${config.prefixo}rl 10 5.`;
+    if (!args.length || args.length > 2) return { erro: uso };
+    if (args.length === 1) {
+        const escolha = normalizarEscolhaRoleta(args[0]);
+        if (!escolha) return { erro: uso };
+        return { valor: apostaMinima, escolha };
+    }
+    const numeros = args.map(a => /^-?\d+$/.test(a) ? parseInt(a, 10) : null);
+    const escolhas = args.map(normalizarEscolhaRoleta);
+    if (numeros[0] != null && numeros[1] != null) {
+        return { valor: numeros[0], escolha: `numero:${numeros[1]}` };
+    }
+    const iValor = numeros[0] != null ? 0 : numeros[1] != null ? 1 : -1;
+    if (iValor < 0 || !escolhas[1 - iValor]) return { erro: uso };
+    return { valor: numeros[iValor], escolha: escolhas[1 - iValor] };
+}
+
 
 // Símbolos do tigrinho: [emoji, premio triplo, premio par]
 // O pagamento e' separado dos simbolos: primeiro sorteia o TIPO de resultado
@@ -855,6 +994,7 @@ async function iniciarBot() {
             cacheMetadata.clear();
             console.log(`\n Bot "${config.nomeBot}" conectado com sucesso!`);
             console.log(` Prefixo: ${config.prefixo} | Max advertências: ${config.maxAdvertencias} | Dry-run: ${config.dryRun ? 'ON' : 'OFF'}`);
+            iniciarAgendamentoGrupo(sock);
         }
 
         if (connection === 'close') {
@@ -874,60 +1014,30 @@ async function iniciarBot() {
             const { id, participants, action } = update;
             cacheMetadata.delete(id);
             aliasPorGrupo.delete(id);
-            if (action !== 'add') return;
+            if (action !== 'add' || !Array.isArray(participants) || !participants.length) return;
 
-            const metadata = await sock.groupMetadata(id);
-            registrarAliases(id, metadata.participants);
-            const groupName = metadata.subject;
+            let metadata = null;
+            try {
+                metadata = await sock.groupMetadata(id);
+                registrarAliases(id, metadata.participants);
+            } catch (e) {
+                console.log(` [BOAS-VINDAS] sem metadata de ${id}: ${e?.message || e}`);
+            }
+            const groupName = metadata?.subject || 'o grupo';
 
             for (const ref of participants) {
-                const p = acharParticipante(metadata.participants, ref);
-                const lid = p?.id || ref;
-                const pn = p?.phoneNumber || (String(ref).includes('@s.whatsapp.net') ? ref : null);
-                const nome = semSufixo(lid);
-                const numero = digitos(pn);
-                const link = numero ? `https://wa.me/${numero}` : null;
-
-                // Foto de perfil: tenta o telefone primeiro, o LID costuma falhar
-                let ppUrl = null;
-                for (const alvo of [pn, lid].filter(Boolean)) {
-                    try {
-                        ppUrl = await sock.profilePictureUrl(alvo, 'image');
-                        if (ppUrl) break;
-                    } catch { /* sem foto */ }
+                try {
+                    const p = metadata ? acharParticipante(metadata.participants, ref) : null;
+                    const alvoId = p?.id || ref;
+                    const nome = semSufixo(alvoId);
+                    const texto = config.mensagemBoasVindas
+                        .replace(/{nome}/g, nome)
+                        .replace(/{grupo}/g, groupName);
+                    await sock.sendMessage(id, { text: texto, mentions: [alvoId] });
+                    console.log(` [BOAS-VINDAS] ${alvoId} em ${id}`);
+                } catch (e) {
+                    console.log(` [BOAS-VINDAS] falhou para ${ref} em ${id}: ${e?.message || e}`);
                 }
-
-                const texto = config.mensagemBoasVindas
-                    .replace(/{nome}/g, nome)
-                    .replace(/{grupo}/g, groupName)
-                    .replace(/{link}/g, link || '(sem número pra link)');
-
-                const botoes = link
-                    ? [{
-                        buttonText: `💬 Chamar o ${nome}`,
-                        nativeFlowInfo: {
-                            name: 'cta_url',
-                            buttonParamsJson: JSON.stringify({ display_text: 'Abrir conversa', url: link })
-                        }
-                    }]
-                    : null;
-
-                let enviou = false;
-                const corpo = ppUrl ? { image: { url: ppUrl }, caption: texto, mentions: [lid] } : { text: texto, mentions: [lid] };
-
-                if (botoes) {
-                    try {
-                        await sock.sendMessage(id, corpo, { buttons: botoes });
-                        enviou = true;
-                    } catch {
-                        console.log(' [BOAS-VINDAS] botão falhou, mandando sem botão');
-                    }
-                }
-                if (!enviou) {
-                    await sock.sendMessage(id, corpo);
-                }
-
-                console.log(` [BOAS-VINDAS] ${lid} em ${id} | foto=${ppUrl ? 'sim' : 'não'} | link=${link || 'não'}`);
             }
         } catch (e) {
             console.log('Erro no boas-vindas:', e.message);
@@ -1082,10 +1192,11 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
 
     if (comando === 'apagar' || comando === 'del' || comando === 'deletar') {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
+        if (!isBotAdmin) return reply('❌ Eu não sou admin aqui, então o WhatsApp não deixa eu apagar mensagem de outra pessoa.');
         const ctx = msg.message?.extendedTextMessage?.contextInfo;
         if (!ctx?.stanzaId) return reply(`↩️ Responda a mensagem que quer apagar com ${config.prefixo}apagar`);
         const tipo = tipoDaMidia(ctx.quotedMessage) || 'mensagem';
-        const key = chaveCitada(ctx, jid);
+        const key = chaveCitada(ctx, jid, metadata.participants);
         const doCache = cacheKeys.has(`${jid}|${ctx.stanzaId}`);
         console.log(` [APAGAR] tipo=${tipo} key=${JSON.stringify(key)} doCache=${doCache}`);
 
@@ -1094,7 +1205,10 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             console.log(` [APAGAR] falhou: ${r.erro}`);
             return reply('❌ Não consegui apagar. O bot precisa ser admin do grupo.');
         }
-        return reply(`🗑️ Apagada (${tipo}).${doCache ? '' : '\n⚠️ Key veio do cache? Não — pode ser msg antiga.'}`);
+        if (!doCache) {
+            return reply(`🗑️ Pedido enviado (${tipo}).\n⚠️ Não achei a mensagem no cache: se ela for antiga ou tiver vindo antes do bot reiniciar, o WhatsApp pode ignorar.`);
+        }
+        return reply(`🗑️ Apagada (${tipo}).`);
     }
 
     if (comando === '+18' || comando === 'adulto' || comando === 'nsfw' || comando === 'porn') {
@@ -1114,7 +1228,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         if (alvo === sender) return reply('❌ Essa mídia é sua, não vou me auto-punir.');
         if (ehProtegido(sock, alvo, metadata.participants)) return reply('❌ Não vou punir admin/dono por isso.');
 
-        const res = await aplicarAdvertencia(sock, jid, alvo, `conteúdo +18 (${tipo})`, chaveCitada(ctx, jid));
+        const res = await aplicarAdvertencia(sock, jid, alvo, `conteúdo +18 (${tipo})`, chaveCitada(ctx, jid, metadata.participants));
         try { await sock.sendMessage(jid, { delete: msg.key }); } catch { /* opcional */ }
 
         if (res.dryRun) return reply(`🧪 DRY-RUN: teria apagado a ${tipo} e dado advertência para @${semSufixo(alvo)}.`);
@@ -1204,7 +1318,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `💰 @${semSufixo(sender)} você tem *${s.toLocaleString('pt-BR')}* fichas.\n\n` +
             `🃏 21: \`${config.prefixo}blackjack 1\`\n` +
             `🐯 Tigre: \`${config.prefixo}tigre 1\`\n` +
-            `🎰 Roleta: \`${config.prefixo}roleta 1 vermelho\``,
+            `🎰 Roleta: \`${config.prefixo}rl 10 vermelho\``,
             [sender]
         );
     }
@@ -1231,12 +1345,13 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         );
     }
 
-    if (['roleta', 'roleta', 'roulette', 'giro'].includes(comando)) {
+    if (['roleta', 'rol', 'rl', 'rlt', 'roulette', 'giro'].includes(comando)) {
         if (!config.cassinoAtivo) return reply('🎰 O cassino está fechado no momento.');
-        const valor = parseInt(args[0]);
-        const escolha = (args[1] || '').toLowerCase();
+        const aposta = interpretarApostaRoleta(args, config.apostaMinima);
+        if (aposta.erro) return reply(aposta.erro);
+        const { valor, escolha } = aposta;
         if (!valor || valor < config.apostaMinima) {
-            return reply(`Uso: ${config.prefixo}roleta <aposta> <vermelho|preto|par|impar|baixo|alto|N 0-36>`);
+            return reply(`Aposta mínima: *${config.apostaMinima}* ficha${config.apostaMinima > 1 ? 's' : ''}.\n\nExemplo: ${config.prefixo}rl 10 vermelho`);
         }
         const dados = carregarJson(CASSINO_PATH);
         const saldo = saldoDe(dados, jid, sender);
@@ -1248,31 +1363,29 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const par = numero !== 0 && numero % 2 === 0;
 
         let ganhou = false, premio = 0, descricao = '';
-        if (escolha === 'vermelho' || escolha === 'vermelha' || escolha === 'red') {
-            ganhou = cor === 'vermelho'; premio = valor * 2;
-            descricao = 'vermelho';
-        } else if (escolha === 'preto' || escolha === 'preta' || escolha === 'black') {
-            ganhou = cor === 'preto'; premio = valor * 2;
-            descricao = 'preto';
-        } else if (escolha === 'par') {
-            ganhou = par; premio = valor * 2; descricao = 'par';
-        } else if (escolha === 'impar' || escolha === 'ímpar') {
-            ganhou = numero !== 0 && !par; premio = valor * 2; descricao = 'ímpar';
-        } else if (escolha === 'baixo' || escolha === '1-18' || escolha === '1a18') {
-            ganhou = numero >= 1 && numero <= 18; premio = valor * 2; descricao = '1 a 18';
-        } else if (escolha === 'alto' || escolha === '19-36' || escolha === '19a36') {
-            ganhou = numero >= 19 && numero <= 36; premio = valor * 2; descricao = '19 a 36';
-        } else if (/^\d{1,2}$/.test(escolha)) {
-            const alvo = parseInt(escolha);
-            if (alvo < 0 || alvo > 36) {
-                return reply(`❌ Número inválido. Use de *0 a 36* _(o 0 é a casa verde e nunca paga)_.`);
+        switch (escolha) {
+            case 'vermelho':
+                ganhou = cor === 'vermelho'; premio = valor * 2; descricao = 'vermelho'; break;
+            case 'preto':
+                ganhou = cor === 'preto'; premio = valor * 2; descricao = 'preto'; break;
+            case 'par':
+                ganhou = par; premio = valor * 2; descricao = 'par'; break;
+            case 'impar':
+                ganhou = numero !== 0 && !par; premio = valor * 2; descricao = 'ímpar'; break;
+            case 'baixo':
+                ganhou = numero >= 1 && numero <= 18; premio = valor * 2; descricao = '1 a 18'; break;
+            case 'alto':
+                ganhou = numero >= 19 && numero <= 36; premio = valor * 2; descricao = '19 a 36'; break;
+            default: {
+                const alvo = parseInt(String(escolha).split(':')[1], 10);
+                if (!Number.isInteger(alvo) || alvo < 0 || alvo > 36) {
+                    return reply(`❌ Número inválido. Use de *0 a 36* _(o 0 é a casa verde e nunca paga)_.`);
+                }
+                // O 0 está na roda, mas é a casa verde e sempre perde.
+                ganhou = numero === alvo && alvo !== 0;
+                premio = valor * 36;
+                descricao = alvo === 0 ? 'número 0 (nunca paga)' : `número ${alvo}`;
             }
-            // o 0 nao esta na roda: e' a casa verde e sempre perde
-            ganhou = numero === alvo && alvo !== 0;
-            premio = valor * 36;
-            descricao = alvo === 0 ? 'número 0 (nunca paga)' : `número ${alvo}`;
-        } else {
-            return reply('❌ Aposta inválida. Use: vermelho, preto, par, impar, baixo, alto ou um número de 0 a 36.');
         }
 
         let saldoFinal = saldo - valor;
@@ -1281,8 +1394,6 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         fs.writeFileSync(CASSINO_PATH, JSON.stringify(dados, null, 2));
 
         const bola = cor === 'verde' ? '🟢' : cor === 'vermelho' ? '🔴' : '⚫';
-        // Caiu no 0: a casa leva. Vale tanto pra cor (o 0 nao e' vermelho nem
-        // preto) quanto pra numero, porque ninguem ganha no verde.
         const saiuZero = numero === 0;
         const cab = ganhou
             ? `🎉 *GANHOU!* +${premio.toLocaleString('pt-BR')} fichas`
@@ -1290,59 +1401,45 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
                 ? `🏠 *CASA VERDE!* Você perdeu ${valor.toLocaleString('pt-BR')} fichas`
                 : `💀 Perdeu ${valor.toLocaleString('pt-BR')} fichas`;
 
-        // === A bola gira antes de revelar ===
-        // Anda pela roda na ordem real e desacelera, como a roleta de cassino.
-        // A desaceleração e' montada ANTES: a soma dos passos diz quantas
-        // casas a bola percorre e a bola comeca essa distancia do alvo, pra
-        // usar todos os quadros e ainda pousar certeiro. Sem isso o ultimo
-        // passo teria de ser cortado e um passo par nunca alcança casa ímpar.
+        // Giro curto na ordem verdadeira: a bola anda e desacelera antes de cair
+        // no bolso certo. A faixa mostra só a bola e os vizinhos para a mensagem
+        // não quebrar no WhatsApp.
         const dormir = ms => new Promise(r => setTimeout(r, ms));
-        const nCasas = ORDEM_ROLETA.length;
-        const posDoNumero = new Map(ORDEM_ROLETA.map((n, i) => [n, i]));
-        const alvo = posDoNumero.get(numero);
+        const nCasas = SEQUENCIA_ROLETA.length;
+        const destino = SEQUENCIA_ROLETA.indexOf(numero);
+        const nQuadros = 4 + Math.floor(Math.random() * 2);
+        const passos = [];
+        let passo = 7, soma = 0;
+        for (let i = 0; i < nQuadros; i++) {
+            passos.push(passo);
+            soma += passo;
+            passo = Math.max(1, Math.floor(passo * 0.72));
+        }
+        if (Math.random() < 0.5) { passos.unshift(nCasas - 1); soma += nCasas - 1; }
 
-        if (alvo != null || saiuZero) {
-            // No 0 a bola cai no miolo: ela ainda gira pelo aro e so o ultimo
-            // quadro acende o 0 no centro, como se tivesse entrado no bolso.
-            const destino = alvo != null ? alvo : Math.floor(Math.random() * nCasas);
-            const nPassos = 9 + Math.floor(Math.random() * 4);
-            const passos = [];
-            let passo = 11, soma = 0;
-            for (let i = 0; i < nPassos; i++) {
-                passos.push(passo);
-                soma += passo;
-                passo = Math.max(1, Math.floor(passo * 0.82));
-            }
-            // meia volta extra no comeco, pra dois giros nao ficarem iguais
-            if (Math.random() < 0.5) { passos.unshift(nCasas - 1); soma += nCasas - 1; }
+        let casa = (destino - soma) % nCasas;
+        if (casa < 0) casa += nCasas;
+        const trilha = [];
+        for (const p of passos) {
+            casa = (casa + p) % nCasas;
+            trilha.push(casa);
+        }
+        if (trilha[trilha.length - 1] !== destino) trilha.push(destino);
 
-            let casa = (destino - soma) % nCasas;
-            if (casa < 0) casa += nCasas;
-            const trilha = [];
-            for (const p of passos) {
-                casa = (casa + p) % nCasas;
-                trilha.push(casa);
-            }
-            if (trilha[trilha.length - 1] !== destino) trilha.push(destino);
-
-            for (let i = 0; i < trilha.length; i++) {
-                const falta = trilha.length - i;
-                await dormir(falta > 4 ? 130 : 320);
-                // o ultimo quadro mostra sempre o numero real sorteado
-                const bolaDoQuadro = i === trilha.length - 1 ? numero : ORDEM_ROLETA[trilha[i]];
-                try {
-                    await sock.sendMessage(jid, {
-                        text:
-                            `\`${desenharMandala(bolaDoQuadro)}\`\n\n` +
-                            `🎰 A bola está girando…`
-                    });
-                } catch { /* grupo sem permissao pra enviar: segue sem a animacao */ }
-            }
+        for (let i = 0; i < trilha.length; i++) {
+            const ultimo = i === trilha.length - 1;
+            const bolaDoQuadro = ultimo ? numero : SEQUENCIA_ROLETA[trilha[i]];
+            await dormir(trilha.length - i > 2 ? 180 : 360);
+            try {
+                await sock.sendMessage(jid, {
+                    text: `🎰 A bola está girando...\n${desenharFaixaRoleta(bolaDoQuadro)}`
+                });
+            } catch { /* grupo sem permissao pra enviar: segue sem a animacao */ }
         }
 
         return reply(
-            `🎰 *ROLETA* ${bola} ${numero} ${cor.toUpperCase()}\n\n` +
-            `\`${desenharMandala(numero)}\`\n` +
+            `🎰 *ROLETA* ${bola} ${numero} ${cor.toUpperCase()}\n` +
+            `${desenharFaixaRoleta(numero)}\n` +
             `🎯 Aposta: ${descricao} • ${valor.toLocaleString('pt-BR')}\n` +
             `${cab}\n` +
             `💰 Saldo: *${saldoFinal.toLocaleString('pt-BR')}*`,
@@ -1647,7 +1744,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         const lista = Object.entries(dados[jid] || {})
             .sort((a, b) => b[1] - a[1])
             .slice(0, 10);
-        if (!lista.length) return reply('🎰 Ninguém jogou ainda. Começa com `!roleta 1 vermelho`!');
+        if (!lista.length) return reply('🎰 Ninguém jogou ainda. Começa com `!rl 10 vermelho`!');
         const medalhas = ['🥇', '🥈', '🥉'];
         let out = '🏆 *RANKING DO CASSINO*\n\n';
         lista.forEach(([u, v], i) => {
@@ -1658,12 +1755,18 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
 
     if (['dar', 'darficha', 'addficha'].includes(comando)) {
         if (!isAdmin) return reply('❌ Só admins podem dar fichas.');
+        const usoDar = `Uso: ${config.prefixo}dar @pessoa 20\nTambém pode responder a mensagem da pessoa com \`${config.prefixo}dar 20\`.`;
         const ctx = msg.message?.extendedTextMessage?.contextInfo;
-        const alvoBruto = ctx?.mentionedJid?.[0] || ctx?.participant;
-        if (!alvoBruto) return reply(`Uso: ${config.prefixo}dar @usuario <valor>`);
-        const alvo = chaveCanonica(jid, alvoBruto, metadata.participants);
-        const valor = parseInt(args[0]);
-        if (!valor || valor <= 0) return reply(`Uso: ${config.prefixo}dar @usuario <valor>`);
+        const alvoBruto = ctx?.mentionedJid?.[0] || ctx?.participant || null;
+        let alvo = alvoBruto ? chaveCanonica(jid, alvoBruto, metadata.participants) : null;
+        if (!alvo && args.length) {
+            const textoAlvo = args.find(a => !/[0-9]/.test(a) && !Object.hasOwn(NUMEROS_PT, normalizar(a)));
+            const p = textoAlvo ? acharParticipantePorTexto(metadata.participants, textoAlvo) : null;
+            if (p) alvo = chaveCanonica(jid, p.id, metadata.participants);
+        }
+        if (!alvo) return reply(usoDar);
+        const valor = extrairInteiro(args);
+        if (!valor || valor <= 0) return reply(usoDar);
         const dados = carregarJson(CASSINO_PATH);
         const novo = saldoDe(dados, jid, alvo) + valor;
         definirSaldo(dados, jid, alvo, novo);
@@ -1671,13 +1774,12 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
         return reply(`🎁 @${semSufixo(alvo)} recebeu *${valor.toLocaleString('pt-BR')}* fichas. Saldo: *${novo.toLocaleString('pt-BR')}*`, [alvo]);
     }
 
-    // Trava/destrava o grupo inteiro: so admins dos ADM falam, e so o dono
-    // do grupo consegue. Serve pra calar o grupo de madrugada e evitar
-    // notificação de madrugada.
+    // Fecha/abre a conversa do grupo: só ADMs falam quando fechado. O bot
+    // precisa ser admin do grupo. Serve pra calar o grupo de madrugada.
     if (['fechar', 'fecharg', 'fechargrupo', 'trancar', 'lock', 'silenciar'].includes(comando)) {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
         try {
-            await sock.groupSettingUpdate(jid, 'locked');
+            await sock.groupSettingUpdate(jid, 'announcement');
             return reply(
                 `🔒 *GRUPO FECHADO!*\n\n` +
                 `Só os administradores podem falar agora.\n` +
@@ -1695,7 +1797,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
     if (['abrirg', 'abrirgrupo', 'destrancar', 'unlock', 'abrir'].includes(comando)) {
         if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
         try {
-            await sock.groupSettingUpdate(jid, 'unlocked');
+            await sock.groupSettingUpdate(jid, 'not_announcement');
             return reply(
                 `🔓 *GRUPO ABERTO!*\n\n` +
                 `Todo mundo pode falar de novo. Bom dia! ☀️`
@@ -1758,7 +1860,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `🐯 \`${config.prefixo}tigre <aposta>\` - Caça-níquel\n` +
             `🃏 \`${config.prefixo}blackjack <aposta>\` - 21 contra a mesa\n` +
             `   ↳ \`${config.prefixo}bj 1\` pede mais | \`${config.prefixo}bj -1\` parar\n` +
-            `🎡 \`${config.prefixo}roleta <aposta> <vermelho|preto|N 0-36>\` - Roleta\n` +
+            `🎡 \`${config.prefixo}rl 10 vermelho\` - Roleta simples\n` +
             `\n` +
             `*🏆 Ranking*\n` +
             `🏅 \`${config.prefixo}recordes\` - Maiores prêmios do tigrinho\n` +
@@ -1809,6 +1911,7 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
             `🔒 \`${config.prefixo}cassino\` - Abre/fecha o cassino\n` +
             `🔒 \`${config.prefixo}fechar\` - Fecha o grupo (só ADMs falam)\n` +
             `🔓 \`${config.prefixo}abrir\` - Abre o grupo\n` +
+            `⏰ Auto: abre 5h e fecha 0h (Angola)\n` +
             `\n` +
             `🎰 *CASSINO* 🎰\n` +
             `🎰 \`${config.prefixo}jogos\` - Ver jogos e fichas\n` +
