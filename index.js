@@ -1,4 +1,4 @@
-import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion, downloadMediaMessage, jidNormalizedUser } from '@whiskeysockets/baileys';
 import qrcode from 'qrcode-terminal';
 import fs from 'node:fs';
 import pino from 'pino';
@@ -74,6 +74,23 @@ function digitos(valor) {
 
 function semSufixo(jid) {
     return String(jid || '').split('@')[0];
+}
+
+/**
+ * O Baileys identifica a sessão com sufixo de aparelho, por exemplo
+ * `5511999999999:37@s.whatsapp.net`, enquanto a metadata do grupo pode trazer
+ * `5511999999999@s.whatsapp.net`. Sem essa normalização o bot não encontra a
+ * si mesmo na lista e conclui, errado, que não é admin.
+ */
+function normalizarId(valor) {
+    const texto = String(valor || '').trim();
+    if (!texto) return '';
+    if (!texto.includes('@')) return texto.replace(/\D/g, '') || texto;
+    try {
+        return jidNormalizedUser(texto) || texto;
+    } catch {
+        return texto;
+    }
 }
 
 // Algumas versoes do WhatsApp entregam o campo de nome como objeto em vez de
@@ -291,9 +308,11 @@ let sockAtual = null;
 const cacheMetadata = new Map();
 const aliasPorGrupo = new Map(); // jid -> Map(chave -> [aliases])
 
-async function pegarMetadata(sock, jid) {
-    const cached = cacheMetadata.get(jid);
-    if (cached && Date.now() - cached.ts < config.cacheMetadataMs) return cached.data;
+async function pegarMetadata(sock, jid, forcar = false) {
+    if (!forcar) {
+        const cached = cacheMetadata.get(jid);
+        if (cached && Date.now() - cached.ts < config.cacheMetadataMs) return cached.data;
+    }
     const data = await sock.groupMetadata(jid);
     cacheMetadata.set(jid, { data, ts: Date.now() });
     return data;
@@ -303,7 +322,7 @@ function registrarAliases(jid, participants) {
     const mapa = new Map();
     for (const p of participants || []) {
         const chaves = [p.id, p.lid, p.phoneNumber].filter(Boolean);
-        for (const c of chaves) mapa.set(semSufixo(c), chaves);
+        for (const c of chaves) mapa.set(normalizarId(c), chaves);
     }
     aliasPorGrupo.set(jid, mapa);
     return mapa;
@@ -405,16 +424,18 @@ function iniciarAgendamentoGrupo(sock) {
 function aliasesDe(jid, ref) {
     if (!ref) return [];
     const mapa = aliasPorGrupo.get(jid);
-    const achado = mapa?.get(semSufixo(ref));
+    const achado = mapa?.get(normalizarId(ref));
     return achado ? achado.filter(x => x !== ref) : [];
 }
 
 function acharParticipante(participants, ref) {
     if (!ref) return null;
+    const alvo = normalizarId(ref);
     const base = semSufixo(ref);
     const num = digitos(ref);
     return (
         participants.find(p =>
+            [p.id, p.lid, p.phoneNumber].some(campo => campo && normalizarId(campo) === alvo) ||
             p.id === ref || p.lid === ref || p.phoneNumber === ref ||
             semSufixo(p.id) === base ||
             (p.lid && semSufixo(p.lid) === base) ||
@@ -430,10 +451,24 @@ function acharParticipante(participants, ref) {
     );
 }
 
-function ehAdmin(participants, jid) {
-    const p = acharParticipante(participants, jid);
+/** Localiza a conta conectada mesmo com sufixo de aparelho, PN ou LID. */
+function acharBot(participants, sock) {
+    const ids = [sock?.user?.id, sock?.user?.lid].filter(Boolean);
+    for (const id of ids) {
+        const p = acharParticipante(participants, id);
+        if (p) return p;
+    }
+    return null;
+}
+
+/** Aceita os dois formatos de admin que o WhatsApp pode entregar. */
+function participanteEhAdmin(p) {
     if (!p) return false;
-    return p.admin === 'admin' || p.admin === 'superadmin';
+    return p.admin === 'admin' || p.admin === 'superadmin' || p.isAdmin === true || p.isSuperAdmin === true;
+}
+
+function ehAdmin(participants, jid) {
+    return participanteEhAdmin(acharParticipante(participants, jid));
 }
 
 /** Chave canônica de advertência: sempre o mesmo id, mesmo se o WA mandar PN ou LID. */
@@ -885,9 +920,8 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
     if (!comando) return;
 
     const isAdmin = ehAdmin(metadata.participants, sender);
-    const botId = sock.user.id;
-    const botP = acharParticipante(metadata.participants, botId) || acharParticipante(metadata.participants, sock.user.lid);
-    const isBotAdmin = botP?.admin === 'admin' || botP?.admin === 'superadmin';
+    const botP = acharBot(metadata.participants, sock);
+    let isBotAdmin = participanteEhAdmin(botP);
 
     const reply = (t, mentions) =>
         sock.sendMessage(jid, mentions ? { text: t, mentions } : { text: t }, { quoted: msg });
@@ -962,8 +996,30 @@ async function handleComandos(sock, msg, jid, texto, sender, metadata) {
     }
 
     if (comando === 'apagar' || comando === 'apaga' || comando === 'del' || comando === 'deletar') {
-        if (!isAdmin) return reply('❌ Só admins podem usar este comando.');
-        if (!isBotAdmin) return reply('❌ Eu não sou admin aqui, então o WhatsApp não deixa eu apagar mensagem de outra pessoa.');
+        let participantes = metadata.participants;
+        let solicitantePode = isAdmin;
+        let botPodeApagar = isBotAdmin;
+
+        // A lista pode estar até 30s desatualizada. Se o bot acabou de ganhar
+        // admin, a primeira verificação ainda vê a lista velha. Por isso, só
+        // nesse caso, busca a metadata de novo antes de desistir.
+        if (!botPodeApagar) {
+            try {
+                const atualizado = await pegarMetadata(sock, jid, true);
+                if (Array.isArray(atualizado?.participants)) {
+                    participantes = atualizado.participants;
+                    registrarAliases(jid, participantes);
+                    solicitantePode = ehAdmin(participantes, sender);
+                    botPodeApagar = participanteEhAdmin(acharBot(participantes, sock));
+                    metadata = { ...metadata, participants: participantes };
+                }
+            } catch (e) {
+                console.log(` [APAGAR] metadata atualizada falhou: ${e?.message || e}`);
+            }
+        }
+
+        if (!solicitantePode) return reply('❌ Só admins podem usar este comando.');
+        if (!botPodeApagar) return reply('❌ Eu não sou admin aqui, então o WhatsApp não deixa eu apagar mensagem de outra pessoa.');
         const ctx = msg.message?.extendedTextMessage?.contextInfo;
         if (!ctx?.stanzaId) return reply(`↩️ Responda a mensagem que quer apagar com ${config.prefixo}apagar`);
         const tipo = tipoDaMidia(ctx.quotedMessage) || 'mensagem';
